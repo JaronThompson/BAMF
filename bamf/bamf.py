@@ -64,7 +64,6 @@ def runODEZ(t_eval, x, params, ctrl_params, dXZ_dt):
     return y
 
 ### Function to process dataframes ###
-
 def process_df(df, sys_vars, measured_vars, controls):
     # store treatment names
     all_treatments = df.Treatments.values
@@ -86,7 +85,7 @@ def process_df(df, sys_vars, measured_vars, controls):
 
         # pull initial condition
         Y_init = np.array(comm_data[sys_vars].values[0], float)
-        
+
         # pull system data
         Y_measured = np.array(comm_data[measured_vars].values, float)
 
@@ -139,23 +138,23 @@ class ODE:
         self.controls = controls
         self.n_ctrls = len(controls)
 
-        # set compressors 
+        # set compressors
         self.compressors = []
         for compressor in compressors:
-            # vmap over all time points 
+            # vmap over all time points
             self.compressors.append(jit(vmap(compressor)))
-        
-        # store derivative of compressors 
+
+        # store derivative of compressors
         self.compressor_primes = []
         for compressor in compressors:
-            # vmap over all time points 
+            # vmap over all time points
             self.compressor_primes.append(jit(vmap(jacfwd(compressor))))
-            
+
         # set up data
         self.datasets = []
         for i,(df, measured_var) in enumerate(zip(dataframes, measured_vars)):
             self.datasets.append(process_df(df, sys_vars, measured_var, controls))
-            
+
         # for additional output messages
         self.verbose = verbose
 
@@ -256,13 +255,13 @@ class ODE:
             yCOV = 0.
             N = 0
             for t_eval, Y_init, Y_compressed, ctrl_params in dataset:
-                
+
                 # count number of observations
                 N += len(t_eval[1:]) * np.sum(np.sum(Y_compressed, 0) > 0) / self.n_sys_vars
 
                 # run model using current parameters
                 if self.A is None:
-                    # run ODE on initial condition 
+                    # run ODE on initial condition
                     output = self.runODE(t_eval, Y_init, self.params, ctrl_params)
 
                     # Determine SSE
@@ -277,11 +276,11 @@ class ODE:
                     # collect gradients and reshape
                     G = np.reshape(output[1:, self.n_sys_vars:],
                                   [output[1:].shape[0], self.n_sys_vars, self.n_params])
-                    
-                    # compress model output and gradient 
-                    G = np.einsum('tck,tki->tci', self.compressor_primes[i](Y_predicted), G) 
+
+                    # compress model output and gradient
+                    G = np.einsum('tck,tki->tci', self.compressor_primes[i](Y_predicted), G)
                     Y_predicted = self.compressors[i](Y_predicted)
-                    
+
                     # Determine SSE
                     Y_error = Y_predicted - Y_compressed[1:]
                     SSE  += self.SSE_next(Y_error, G, self.Ainv)
@@ -328,8 +327,8 @@ class ODE:
 
         for i, dataset in enumerate(self.datasets):
             # loop over each sample in dataset
-            for t_eval, Y_init, Y_compressed, ctrl_params in dataset:            
-                
+            for t_eval, Y_init, Y_compressed, ctrl_params in dataset:
+
                 # run model using current parameters, output = [n_time, n_sys_vars]
                 output = self.runODEZ(t_eval, Y_init, params, ctrl_params)
                 Y_predicted = output[1:, :self.n_sys_vars]
@@ -338,10 +337,10 @@ class ODE:
                 G = np.reshape(output[1:, self.n_sys_vars:],
                               [output[1:].shape[0], self.n_sys_vars, self.n_params])
 
-                # compress model output and gradient 
-                G = np.einsum('tck,tki->tci', self.compressor_primes[i](Y_predicted), G) 
+                # compress model output and gradient
+                G = np.einsum('tck,tki->tci', self.compressor_primes[i](Y_predicted), G)
                 Y_predicted = self.compressors[i](Y_predicted)
-                
+
                 # Determine error
                 Y_error = Y_predicted - Y_compressed[1:]
 
@@ -381,9 +380,9 @@ class ODE:
                 G = np.reshape(output[1:, self.n_sys_vars:],
                               [output[1:].shape[0], self.n_sys_vars, self.n_params])
 
-                # compress model output and gradient 
-                G = np.einsum('tck,tki->tci', self.compressor_primes[i](Y_predicted), G) 
-                
+                # compress model output and gradient
+                G = np.einsum('tck,tki->tci', self.compressor_primes[i](Y_predicted), G)
+
                 # compute Hessian
                 self.A += self.A_next(G, self.Beta[i])
 
@@ -431,9 +430,170 @@ class ODE:
         # compress model output
         Y_predicted = output[:, :self.n_sys_vars]
 
-        # calculate variance of each output (dimension = [steps, outputs])
+        # calculate covariance of each output (dimension = [steps, outputs])
         covariance = np.linalg.inv(self.Beta[compressor]) + self.GAinvG(G, self.Ainv)
+
+        # predicted stdv
         get_diag = vmap(jnp.diag, (0,))
         stdv = np.sqrt(get_diag(covariance))
 
         return Y_predicted, stdv, covariance
+
+    ### MCMC Code ###
+    def fit_MCMC(self,
+                 num_warmup=1000,
+                 num_samples=1000,
+                 num_subsample=10,
+                 num_chains=5,
+                 scale=1.,
+                 seed=0):
+
+        # adjusting the scale adjusts the acceptance ratio
+        # ideally the acceptance ratio is between .2 and .3
+        # if the acceptance ratio is too high, increase the scale
+        # if the acceptance ratio is too low, reduce the scale
+        # increasing the scale increases the stdv. of the proposal distribution
+
+        # generate random key
+        key = random.PRNGKey(seed)
+
+        # total number of samples = number of chains * num_samples
+        self.num_chains = num_chains
+        num_samples *= num_chains*num_subsample
+        num_samples += num_warmup
+
+        # measured values for each fidelity
+        true = []
+        for i, data in enumerate(self.datasets):
+            true_vals = []
+            for t_eval, Y_init, Y_compressed, ctrl_params in data:
+                true_vals.append(Y_compressed[1:])
+            true.append(true_vals)
+
+        # scaled Cholesky decomposition of Laplace estimated parameter covariance
+        L = scale*np.linalg.cholesky(self.Ainv)/np.sqrt(self.n_params)
+
+        # compile functions for sampling and evaluating samples
+        print("Compiling...")
+
+        # use Laplace approximated posterior as proposal distribution
+        @jit
+        def sample_proposal(subkey, current_theta):
+
+            # sample from Gaussian
+            z_theta = random.normal(subkey, shape=(self.n_params,))
+            theta = current_theta + L@z_theta
+
+            # return samples
+            return theta
+
+        # compile function to compute acceptance probability
+        @jit
+        def acceptance_prob(new_sse, old_sse, new_theta, old_theta):
+
+            # log of acceptance probability
+            log_ratio = (-new_sse
+                         -self.alpha*jnp.sum(new_theta**2)
+                         +old_sse
+                         +self.alpha*jnp.sum(old_theta**2))
+
+            # take exponent and return
+            return jnp.exp(log_ratio/2.)
+
+        # function to make predictions
+        @jit
+        def sse(theta):
+            sse_val = 0.
+            for i, data in enumerate(self.datasets):
+                preds = []
+                for t_eval, Y_init, Y_compressed, ctrl_params in data:
+                    preds.append(self.compressors[i](self.runODE(t_eval, Y_init, theta, ctrl_params)[1:, :self.n_sys_vars]))
+                sse_val += jnp.sum(jnp.array([jnp.einsum('tk,kl,tl',t-p,self.Beta[i],t-p) for t,p in zip(true[i], preds)]))
+            return sse_val
+
+        # run MCMC and store samples
+        acc_theta = [np.copy(self.params)]
+        old_sse = sse(acc_theta[-1])
+        n_acc = 0
+        n_try = 0
+        for _ in tqdm(range(num_samples), desc='Run'):
+            # generate new random key
+            key, subkey = random.split(key)
+
+            # sample from proposal
+            new_theta = sample_proposal(subkey, acc_theta[-1])
+
+            # make predictions
+            new_sse = sse(new_theta)
+
+            # compute acceptance probability
+            acc_prb = acceptance_prob(new_sse, old_sse, new_theta, acc_theta[-1])
+
+            # decide whether to accept new parameters
+            if np.min([1., acc_prb]) > random.uniform(subkey):
+                acc_theta.append(new_theta)
+                old_sse = new_sse
+                n_acc += 1
+            else:
+                acc_theta.append(acc_theta[-1])
+
+            # count number of trials
+            n_try += 1
+
+        # store posterior samples
+        self.posterior_params = np.stack(acc_theta)[num_warmup+1::num_subsample]
+
+        # acceptance probability
+        print("Acceptance ratio: {:.2f}\n".format(n_acc / n_try))
+
+        # compute potential scale reduction
+        chains = np.stack(np.split(self.posterior_params, self.num_chains))
+        m,n,p = chains.shape
+        B = n/(m-1) * np.sum((np.mean(chains, 1) - np.mean(chains, (0,1)))**2, 0)
+        W = np.mean( 1/(n-1)*np.sum((np.transpose(chains, (1,0,2)) - np.mean(chains, 1))**2 , 0) , 0)
+        var_plus = (n-1)/n*W + B/n
+        R = np.round(np.sqrt(var_plus/W),2)
+
+        # save statistics
+        self.mcmc_summary = pd.DataFrame()
+        self.mcmc_summary['Params'] = ['w'+str(i+1) for i in range(self.n_params)]
+        self.mcmc_summary['mean'] = np.mean(self.posterior_params, 0)
+        self.mcmc_summary['median'] = np.median(self.posterior_params, 0)
+        self.mcmc_summary['stdv'] = np.std(self.posterior_params, 0)
+        self.mcmc_summary['r_hat'] = R
+
+    def compute_effective_samples():
+
+        # compute potential scale reduction
+        chains = np.stack(np.split(self.posterior_params, self.num_chains))
+        m,n,p = chains.shape
+        B = n/(m-1) * np.sum((np.mean(chains, 1) - np.mean(chains, (0,1)))**2, 0)
+        W = np.mean( 1/(n-1)*np.sum((np.transpose(chains, (1,0,2)) - np.mean(chains, 1))**2 , 0) , 0)
+        var_plus = (n-1)/n*W + B/n
+
+        # variogram of t
+        Vt = lambda t: 1/(m*(n-t))*np.sum(np.sum(np.stack([(chains[:, i] - chains[:, i-t])**2 for i in range(t+1,n)]), 0), 0)
+        # lag of t
+        pt = lambda t: 1 - Vt(t) / (2*var_plus)
+
+        # compute effective number of samples for each feature
+        n_eff = []
+        for i in range(self.n_params):
+            t = 1
+            pt_sum = 0
+            while pt(t+1)[i]+pt(t+2)[i] > 0 and t < n-4:
+                pt_sum += pt(t)[i]
+                t += 1
+            n_eff.append(m*n / (1 + 2*pt_sum))
+
+        # save statistics
+        self.mcmc_summary['n_eff'] = n_eff
+        return self.mcmc_summary
+
+    # function to predict from posterior samples
+    def predict_MCMC(self, x_test, t_eval, ctrl_params=[]):
+
+        # make point predictions of shape [n_mcmc, n_samples, n_time, n_outputs]
+        preds = vmap(lambda params: self.runODE(t_eval, x_test, params, ctrl_params), (0,))(self.posterior_params)
+
+        return preds
