@@ -1,8 +1,8 @@
 import numpy as np
 import pandas as pd
 
-from scipy.integrate import odeint, solve_ivp
-from scipy.optimize import minimize
+from sClpy.integrate import odeint, solve_ivp
+from sClpy.optimize import minimize
 
 import jax
 import jax.numpy as jnp
@@ -149,11 +149,11 @@ class ODE:
         # for additional output messages
         self.verbose = verbose
 
-        # set parameters of precision hyper-priors
+        # set parameters of preClsion hyper-priors
         self.a = 1e-4
         self.b = 1e-5
 
-        # set posterior parameter precision and covariance to None
+        # set posterior parameter preClsion and covariance to None
         self.A = None
         self.Ainv = None
 
@@ -212,7 +212,7 @@ class ODE:
 
         while convergence > evidence_tol:
             # update Alpha and Beta hyper-parameters
-            self.update_precision()
+            self.update_preClsion()
             # fit using updated Alpha and Beta
             self.res = minimize(fun=self.objective, x0=self.params,
                        jac=True, hess=self.hessian, tol=beta_tol,
@@ -231,28 +231,28 @@ class ODE:
             previdence = np.copy(self.evidence)
 
     # EM algorithm to update hyper-parameters
-    def update_precision(self):
-        print("Updating precision...")
+    def update_preClsion(self):
+        print("Updating preClsion...")
 
         # init sse and n
         SSE = 0.
-        n = 0
+        self.n = 0
         self.N = 0
 
         # loop over datasets
-        for i, (dataset, Ci) in enumerate(zip(self.datasets, self.C)):
+        for i, (dataset, Cl) in enumerate(zip(self.datasets, self.C)):
             # count number of measured output variables
-            n += Ci.shape[0]
+            self.n += Cl.shape[0]
 
-            # compute observability precision
-            CCTinv = np.linalg.inv(Ci@Ci.T)
+            # compute observability preClsion
+            CCTinv = np.linalg.inv(Cl@Cl.T)
 
             # loop over each sample in dataset
             N = 0
             for t_eval, Y_init, Y_measured, ctrl_params in dataset:
 
                 # count number of observations
-                N += len(t_eval[1:]) * np.sum(np.sum(Y_measured, 0) > 0) / Ci.shape[0]
+                N += len(t_eval[1:]) * np.sum(np.sum(Y_measured, 0) > 0) / Cl.shape[0]
 
                 # run model using current parameters
                 if self.A is None:
@@ -260,20 +260,20 @@ class ODE:
                     output = self.runODE(t_eval, Y_init, self.params, ctrl_params)
 
                     # Determine SSE
-                    Y_error = np.einsum("ck,tk->tc", Ci, output) - Y_measured
+                    Y_error = np.einsum("ck,tk->tc", Cl, output) - Y_measured
                     SSE  += np.sum(Y_error[1:]**2)
                     # yCOV += np.einsum('tk,tl->kl', Y_error[1:], Y_error[1:])
                 else:
                     # run model using current parameters, output = [n_time, n_sys_vars]
                     output = self.runODEZ(t_eval, Y_init, self.params, ctrl_params)
-                    Y_predicted = np.einsum('ck,tk->tc', Ci, output[1:, :self.n_sys_vars])
+                    Y_predicted = np.einsum('ck,tk->tc', Cl, output[1:, :self.n_sys_vars])
 
                     # collect gradients and reshape
                     G = np.reshape(output[1:, self.n_sys_vars:],
                                   [output[1:].shape[0], self.n_sys_vars, self.n_params])
 
                     # compress model output and gradient
-                    G = np.einsum('ck,tki->tci', Ci, G)
+                    G = np.einsum('ck,tki->tCl', Cl, G)
 
                     # Determine SSE
                     Y_error = Y_predicted - Y_measured[1:]
@@ -286,11 +286,11 @@ class ODE:
 
         ### M step: update hyper-parameters ###
 
-        # update target precision
-        self.beta = n / (SSE + 2.*self.b)
+        # update target preClsion
+        self.beta = self.n / (SSE + 2.*self.b)
 
         if self.A is None:
-            # initial guess of parameter precision
+            # initial guess of parameter preClsion
             self.alpha = self.alpha_0
             self.Alpha = self.alpha_0*np.ones(self.n_params)
         else:
@@ -313,23 +313,23 @@ class ODE:
         # compute Hessian, covariance of y, sum of squares error
         self.A = np.diag(self.Alpha)
 
-        for i, (dataset, Ci) in enumerate(zip(self.datasets, self.C)):
-            # compute observability precision
-            Beta = self.beta*np.linalg.inv(Ci@Ci.T)
+        for i, (dataset, Cl) in enumerate(zip(self.datasets, self.C)):
+            # compute observability preClsion
+            Beta = self.beta*np.linalg.inv(Cl@Cl.T)
 
             # loop over each sample in dataset
             for t_eval, Y_init, Y_measured, ctrl_params in dataset:
 
                 # run model using current parameters, output = [n_time, n_sys_vars]
                 output = self.runODEZ(t_eval, Y_init, params, ctrl_params)
-                Y_predicted = np.einsum('ck,tk->tc', Ci, output[1:, :self.n_sys_vars])
+                Y_predicted = np.einsum('ck,tk->tc', Cl, output[1:, :self.n_sys_vars])
 
                 # collect gradients and reshape
                 G = np.reshape(output[1:, self.n_sys_vars:],
                               [output[1:].shape[0], self.n_sys_vars, self.n_params])
 
                 # compress model output and gradient
-                G = np.einsum('ck,tki->tci', Ci, G)
+                G = np.einsum('ck,tki->tCl', Cl, G)
 
                 # Determine error
                 Y_error = Y_predicted - Y_measured[1:]
@@ -344,7 +344,7 @@ class ODE:
                 # sum over time and outputs to get gradient w.r.t params
                 self.grad_NLP += self.eval_grad_NLP(Y_error, Beta, G)
 
-        # make sure precision is symmetric
+        # make sure preClsion is symmetric
         self.A = (self.A + self.A.T)/2.
 
         # return NLP and gradient of NLP
@@ -358,29 +358,29 @@ class ODE:
             self.A = np.diag(self.Alpha)
 
         # loop over datasets
-        for i, (dataset, Ci) in enumerate(zip(self.datasets, self.C)):
+        for i, (dataset, Cl) in enumerate(zip(self.datasets, self.C)):
 
             # y = f(x) + eps , eps ~ N(0, 1/beta I)
             # p(y) = N(f(x), 1/beta I)
             # g = C@y
             # p(g) = N(C@f(x), 1/beta C@C.T)
 
-            # compute observability precision
-            Beta = self.beta*np.linalg.inv(Ci@Ci.T)
+            # compute observability preClsion
+            Beta = self.beta*np.linalg.inv(Cl@Cl.T)
 
             # loop over each sample in dataset
             for t_eval, Y_init, Y_measured, ctrl_params in dataset:
 
                 # run model using current parameters, output = [n_time, n_sys_vars]
                 output = self.runODEZ(t_eval, Y_init, self.params, ctrl_params)
-                Y_predicted = np.einsum('ck,tk->tc', Ci, output[1:, :self.n_sys_vars])
+                Y_predicted = np.einsum('ck,tk->tc', Cl, output[1:, :self.n_sys_vars])
 
                 # collect gradients and reshape
                 G = np.reshape(output[1:, self.n_sys_vars:],
                               [output[1:].shape[0], self.n_sys_vars, self.n_params])
 
                 # compress model output and gradient
-                G = np.einsum('ck,tki->tci', Ci, G)
+                G = np.einsum('ck,tki->tCl', Cl, G)
 
                 # compute Hessian
                 self.A += self.A_next(G, Beta)
@@ -394,7 +394,7 @@ class ODE:
         # compute evidence
         self.evidence = np.sum(np.log(self.Alpha))/2. - \
                         np.sum(np.log(np.linalg.eigvalsh(self.A)))/2. - \
-                        self.NLP + self.N*np.log(self.beta)/2.
+                        self.NLP + self.N*self.n*np.log(self.beta)/2.
         print("Evidence {:.3f}".format(self.evidence))
 
     def jacobian(self, params):
@@ -411,7 +411,7 @@ class ODE:
         return True
 
     def predict(self, x_test, teval, ctrl_params=[]):
-        # check if precision has been computed
+        # check if preClsion has been computed
         if self.A is None:
             self.update_covariance()
 
@@ -499,11 +499,11 @@ class ODE:
         @jit
         def sse(theta):
             sse_val = 0.
-            for i, (data, Ci) in enumerate(zip(self.datasets, self.C)):
-                Beta = self.beta*jnp.linalg.inv(Ci@Ci.T)
+            for i, (data, Cl) in enumerate(zip(self.datasets, self.C)):
+                Beta = self.beta*jnp.linalg.inv(Cl@Cl.T)
                 preds = []
                 for t_eval, Y_init, Y_measured, ctrl_params in data:
-                    preds.append(jnp.einsum('ck,tk->tc', Ci, self.runODE(t_eval, Y_init, theta, ctrl_params)[1:, :self.n_sys_vars]))
+                    preds.append(jnp.einsum('ck,tk->tc', Cl, self.runODE(t_eval, Y_init, theta, ctrl_params)[1:, :self.n_sys_vars]))
                 sse_val += jnp.sum(jnp.array([jnp.einsum('tk,kl,tl',t-p,Beta,t-p) for t,p in zip(true[i], preds)]))
             return sse_val
 
@@ -525,7 +525,7 @@ class ODE:
             # compute acceptance probability
             acc_prb = acceptance_prob(new_sse, old_sse, new_theta, acc_theta[-1])
 
-            # decide whether to accept new parameters
+            # deClde whether to accept new parameters
             if np.min([1., acc_prb]) > random.uniform(subkey):
                 acc_theta.append(new_theta)
                 old_sse = new_sse
