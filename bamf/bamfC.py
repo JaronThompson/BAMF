@@ -1,13 +1,14 @@
 import numpy as np
 import pandas as pd
 
-from sClpy.integrate import odeint, solve_ivp
-from sClpy.optimize import minimize
+from scipy.integrate import odeint, solve_ivp
+from scipy.optimize import minimize
 
 import jax
 import jax.numpy as jnp
 from jax import jit, jacfwd, vmap, random
 from jax.experimental.ode import odeint
+from jax.scipy.linalg import block_diag
 
 # import MCMC library
 import numpyro
@@ -65,17 +66,10 @@ def runODEZ(t_eval, x, params, ctrl_params, dXZ_dt):
 
 ### Function to process dataframes ###
 def process_df(df, sys_vars, measured_vars, controls):
-    # store treatment names
-    all_treatments = df.Treatments.values
-    unique_treatments = np.unique(all_treatments)
 
     # store measured datasets for quick access
     data = []
-    for i,treatment in enumerate(unique_treatments):
-
-        # pull community trajectory
-        comm_inds = np.in1d(df['Treatments'].values, treatment)
-        comm_data = df.iloc[comm_inds].copy()
+    for treatment, comm_data in df.groupby("Treatments"):
 
         # make sure comm_data is sorted in chronological order
         comm_data.sort_values(by='Time', ascending=True, inplace=True)
@@ -93,7 +87,7 @@ def process_df(df, sys_vars, measured_vars, controls):
         ctrl_params = np.array(comm_data[controls].values, float)
 
         # append t_eval and Y_measured to data list
-        data.append([t_eval, Y_init, Y_measured, ctrl_params])
+        data.append([treatment, t_eval, Y_init, Y_measured, ctrl_params])
     return data
 
 class ODE:
@@ -149,11 +143,11 @@ class ODE:
         # for additional output messages
         self.verbose = verbose
 
-        # set parameters of preClsion hyper-priors
-        self.a = 1e-4
-        self.b = 1e-5
+        # set parameters of precision hyper-priors
+        self.a = 1e-3
+        self.b = 1e-4
 
-        # set posterior parameter preClsion and covariance to None
+        # set posterior parameter precision and covariance to None
         self.A = None
         self.Ainv = None
 
@@ -193,6 +187,22 @@ class ODE:
             return jnp.einsum('tki, kl, tlj->ij', G, Beta, G)
         self.A_next = jit(A_next)
 
+        # jit compile inverse Hessian computation step
+        def Ainv_next(G, Ainv, BetaInv):
+            GAinv = G@Ainv
+            Ainv_step = GAinv.T@jnp.linalg.inv(BetaInv + GAinv@G.T)@GAinv
+            Ainv_step = (Ainv_step + Ainv_step.T)/2.
+            return Ainv_step
+        self.Ainv_next = jit(Ainv_next)
+
+        # jit compile inverse Hessian computation step
+        def Ainv_prev(G, Ainv, BetaInv):
+            GAinv = G@Ainv
+            Ainv_step = GAinv.T@jnp.linalg.inv(GAinv@G.T - BetaInv)@GAinv
+            Ainv_step = (Ainv_step + Ainv_step.T)/2.
+            return Ainv_step
+        self.Ainv_prev = jit(Ainv_prev)
+
         def GAinvG(G, Ainv):
             return jnp.einsum('tki,ij,tlj->tkl', G, Ainv, G)
         self.GAinvG = jit(GAinvG)
@@ -205,6 +215,24 @@ class ODE:
             return jnp.einsum('tk,kl,tli->i', Y_error, Beta, G)
         self.eval_grad_NLP = jit(eval_grad_NLP)
 
+        # jit compile prediction covariance computation
+        def compute_searchCOV(Beta, G, Ainv):
+            # dimensions of sample
+            n_t, n_y, n_theta = G.shape
+            # stack G over time points [n, n_t, n_out, n_theta]--> [n, n_t*n_out, n_theta]
+            Gaug = jnp.concatenate(G, 0)
+            return jnp.eye(n_t*n_y) + jnp.einsum("kl,li,ij,mj->km", block_diag(*[Beta]*n_t), Gaug, Ainv, Gaug)
+        self.compute_searchCOV = jit(compute_searchCOV)
+
+        # jit compile prediction covariance computation
+        def compute_forgetCOV(Beta, G, Ainv):
+            # dimensions of sample
+            n_t, n_y, n_theta = G.shape
+            # stack G over time points [n, n_t, n_out, n_theta]--> [n, n_t*n_out, n_theta]
+            Gaug = jnp.concatenate(G, 0)
+            return jnp.eye(n_t*n_y) - jnp.einsum("kl,li,ij,mj->km", block_diag(*[Beta]*n_t), Gaug, Ainv, Gaug)
+        self.compute_forgetCOV = jit(compute_forgetCOV)
+
     def fit(self, evidence_tol=1e-3, beta_tol=1e-3):
         # estimate parameters using gradient descent
         convergence = np.inf
@@ -212,7 +240,7 @@ class ODE:
 
         while convergence > evidence_tol:
             # update Alpha and Beta hyper-parameters
-            self.update_preClsion()
+            self.update_precision()
             # fit using updated Alpha and Beta
             self.res = minimize(fun=self.objective, x0=self.params,
                        jac=True, hess=self.hessian, tol=beta_tol,
@@ -231,25 +259,23 @@ class ODE:
             previdence = np.copy(self.evidence)
 
     # EM algorithm to update hyper-parameters
-    def update_preClsion(self):
-        print("Updating preClsion...")
+    def update_precision(self):
+        print("Updating precision...")
 
         # init sse and n
         SSE = 0.
-        self.n = 0
-        self.N = 0
+        self.n = []
+        self.N = []
 
         # loop over datasets
         for i, (dataset, Cl) in enumerate(zip(self.datasets, self.C)):
-            # count number of measured output variables
-            self.n += Cl.shape[0]
 
-            # compute observability preClsion
+            # compute observability precision
             CCTinv = np.linalg.inv(Cl@Cl.T)
 
             # loop over each sample in dataset
             N = 0
-            for t_eval, Y_init, Y_measured, ctrl_params in dataset:
+            for treatment, t_eval, Y_init, Y_measured, ctrl_params in dataset:
 
                 # count number of observations
                 N += len(t_eval[1:]) * np.sum(np.sum(Y_measured, 0) > 0) / Cl.shape[0]
@@ -273,24 +299,26 @@ class ODE:
                                   [output[1:].shape[0], self.n_sys_vars, self.n_params])
 
                     # compress model output and gradient
-                    G = np.einsum('ck,tki->tCl', Cl, G)
+                    G = np.einsum('ck,tki->tci', Cl, G)
 
                     # Determine SSE
                     Y_error = Y_predicted - Y_measured[1:]
                     SSE  += self.SSE_next(Y_error, CCTinv, G, self.Ainv)
-                    # yCOV += self.yCOV_next(Y_error, G, self.Ainv)
 
-            # update sample count
-            self.N += N
-            SSE /= N
+            # count number of measured output variables
+            self.n.append(Cl.shape[0])
+            self.N.append(N)
 
         ### M step: update hyper-parameters ###
 
-        # update target preClsion
-        self.beta = self.n / (SSE + 2.*self.b)
+        # update target precision
+        self.n_total = 0
+        for n, N in zip(self.n, self.N):
+            self.n_total += n*N
+        self.beta = self.n_total / (SSE + 2.*self.b)
 
         if self.A is None:
-            # initial guess of parameter preClsion
+            # initial guess of parameter precision
             self.alpha = self.alpha_0
             self.Alpha = self.alpha_0*np.ones(self.n_params)
         else:
@@ -300,7 +328,7 @@ class ODE:
             self.Alpha = 1./((self.params-self.prior)**2 + np.diag(self.Ainv) + 2.*self.a)
 
         if self.verbose:
-            print("Total samples: {:.0f}, Updated regularization: {:.2e}".format(self.N, self.alpha/self.beta))
+            print("Total samples: {:.0f}, Updated regularization: {:.2e}".format(self.n_total, self.alpha/self.beta))
 
     def objective(self, params):
         # compute residuals
@@ -314,11 +342,11 @@ class ODE:
         self.A = np.diag(self.Alpha)
 
         for i, (dataset, Cl) in enumerate(zip(self.datasets, self.C)):
-            # compute observability preClsion
+            # compute observability precision
             Beta = self.beta*np.linalg.inv(Cl@Cl.T)
 
             # loop over each sample in dataset
-            for t_eval, Y_init, Y_measured, ctrl_params in dataset:
+            for treatment, t_eval, Y_init, Y_measured, ctrl_params in dataset:
 
                 # run model using current parameters, output = [n_time, n_sys_vars]
                 output = self.runODEZ(t_eval, Y_init, params, ctrl_params)
@@ -329,7 +357,7 @@ class ODE:
                               [output[1:].shape[0], self.n_sys_vars, self.n_params])
 
                 # compress model output and gradient
-                G = np.einsum('ck,tki->tCl', Cl, G)
+                G = np.einsum('ck,tki->tci', Cl, G)
 
                 # Determine error
                 Y_error = Y_predicted - Y_measured[1:]
@@ -344,7 +372,7 @@ class ODE:
                 # sum over time and outputs to get gradient w.r.t params
                 self.grad_NLP += self.eval_grad_NLP(Y_error, Beta, G)
 
-        # make sure preClsion is symmetric
+        # make sure precision is symmetric
         self.A = (self.A + self.A.T)/2.
 
         # return NLP and gradient of NLP
@@ -365,11 +393,11 @@ class ODE:
             # g = C@y
             # p(g) = N(C@f(x), 1/beta C@C.T)
 
-            # compute observability preClsion
+            # compute observability precision
             Beta = self.beta*np.linalg.inv(Cl@Cl.T)
 
             # loop over each sample in dataset
-            for t_eval, Y_init, Y_measured, ctrl_params in dataset:
+            for treatment, t_eval, Y_init, Y_measured, ctrl_params in dataset:
 
                 # run model using current parameters, output = [n_time, n_sys_vars]
                 output = self.runODEZ(t_eval, Y_init, self.params, ctrl_params)
@@ -380,7 +408,7 @@ class ODE:
                               [output[1:].shape[0], self.n_sys_vars, self.n_params])
 
                 # compress model output and gradient
-                G = np.einsum('ck,tki->tCl', Cl, G)
+                G = np.einsum('ck,tki->tci', Cl, G)
 
                 # compute Hessian
                 self.A += self.A_next(G, Beta)
@@ -393,8 +421,12 @@ class ODE:
     def update_evidence(self):
         # compute evidence
         self.evidence = np.sum(np.log(self.Alpha))/2. - \
-                        np.sum(np.log(np.linalg.eigvalsh(self.A)))/2. - \
-                        self.NLP + self.N*self.n*np.log(self.beta)/2.
+                        np.sum(np.log(np.linalg.eigvalsh(self.A)))/2. - self.NLP
+
+        # add precision terms
+        for N, n in zip(self.N, self.n):
+            self.evidence += N*n*np.log(self.beta)/2.
+
         print("Evidence {:.3f}".format(self.evidence))
 
     def jacobian(self, params):
@@ -410,8 +442,15 @@ class ODE:
             print("Total weighted fitting error: {:.3f}".format(self.NLP))
         return True
 
+    def predict_point(self, x_test, teval, ctrl_params=[]):
+
+        # make predictions given initial conditions and evaluation times
+        Y_predicted = self.runODE(teval, x_test, self.params, ctrl_params)
+
+        return Y_predicted
+
     def predict(self, x_test, teval, ctrl_params=[]):
-        # check if preClsion has been computed
+        # check if precision has been computed
         if self.A is None:
             self.update_covariance()
 
@@ -461,7 +500,7 @@ class ODE:
         true = []
         for i, data in enumerate(self.datasets):
             true_vals = []
-            for t_eval, Y_init, Y_measured, ctrl_params in data:
+            for treatment, t_eval, Y_init, Y_measured, ctrl_params in data:
                 true_vals.append(Y_measured[1:])
             true.append(true_vals)
 
@@ -502,7 +541,7 @@ class ODE:
             for i, (data, Cl) in enumerate(zip(self.datasets, self.C)):
                 Beta = self.beta*jnp.linalg.inv(Cl@Cl.T)
                 preds = []
-                for t_eval, Y_init, Y_measured, ctrl_params in data:
+                for treatment, t_eval, Y_init, Y_measured, ctrl_params in data:
                     preds.append(jnp.einsum('ck,tk->tc', Cl, self.runODE(t_eval, Y_init, theta, ctrl_params)[1:, :self.n_sys_vars]))
                 sse_val += jnp.sum(jnp.array([jnp.einsum('tk,kl,tl',t-p,Beta,t-p) for t,p in zip(true[i], preds)]))
             return sse_val
@@ -525,7 +564,7 @@ class ODE:
             # compute acceptance probability
             acc_prb = acceptance_prob(new_sse, old_sse, new_theta, acc_theta[-1])
 
-            # deClde whether to accept new parameters
+            # decide whether to accept new parameters
             if np.min([1., acc_prb]) > random.uniform(subkey):
                 acc_theta.append(new_theta)
                 old_sse = new_sse
@@ -593,3 +632,133 @@ class ODE:
         preds = vmap(lambda params: self.runODE(t_eval, x_test, params, ctrl_params), (0,))(self.posterior_params)
 
         return preds
+
+    def search(self, df_main, N, C, Ainv_q=None, batch_size=512):
+        # process dataframe
+        if self.verbose:
+            print("Processing design dataframe...")
+        design_space = process_df(df_main, self.sys_vars, self.sys_vars, self.controls)
+
+        # total number of possible experimental conditions
+        n_samples = len(design_space)
+        batch_size = np.min([batch_size, n_samples])
+
+        # init parameter covariance
+        if Ainv_q is None:
+            Ainv_q = jnp.copy(self.Ainv)
+
+        # init observability precision
+        Beta = self.beta*np.linalg.inv(C@C.T)
+        BetaInv = (C@C.T)/self.beta
+
+        # store sensitivity to each condition
+        if self.verbose:
+            print("Computing sensitivies...")
+        Gs = {}
+        exp_names = []
+        for treatment, t_eval, Y_init, Y_measured, ctrl_params in design_space:
+            exp_names.append(treatment)
+
+            # run model using current parameters, output = [n_time, n_sys_vars]
+            output = self.runODEZ(t_eval, Y_init, self.params, ctrl_params)
+            Y_predicted = output[1:, :self.n_sys_vars]
+
+            # collect gradients and reshape
+            G = np.reshape(output[1:, self.n_sys_vars:],
+                          [output[1:].shape[0], self.n_sys_vars, self.n_params])
+
+            # compress model output and gradient
+            G = np.einsum('ck,tki->tci', C, G)
+
+            # store in hash table of sensitivies
+            Gs[treatment] = G
+
+        # # randomly select experiments
+        # best_experiments = list(np.random.choice(exp_names, 10, replace=False))
+        # for exp in best_experiments:
+        #     # update parameter covariance given selected experiment
+        #     for Gt in Gs[exp]:
+        #         Ainv_q -= self.Ainv_next(Gt, Ainv_q, BetaInv)
+
+        # search for new experiments
+        best_experiments = []
+        N_selected = 0
+        while N_selected < N:
+
+            # compute information content of each observation
+            f_I = []
+            for treatment in exp_names:
+                # predCOV has shape [n_time, n_out, n_out]
+                searchCOV = self.compute_searchCOV(Beta, Gs[treatment], Ainv_q)
+                f_I.append(self.fast_utility(searchCOV))
+
+            # concatenate utilities
+            utilities = np.array(f_I).ravel()
+            # print("Top 5 utilities:, ", np.sort(utilities)[::-1][:5])
+
+            # sort utilities from best to worst
+            exp_sorted = jnp.argsort(utilities)[::-1]
+            for exp in exp_sorted:
+                treatment, t_eval, Y_init, Y_measured, ctrl_params = design_space[exp]
+                if treatment not in best_experiments:
+                    best_experiments.append(treatment)
+                    # number of selected observations is the evaluation time
+                    # minus 1 to ignore initial condition
+                    N_selected += 1 # len(t_eval) - 1
+
+                    # update parameter covariance given selected experiment
+                    for Gt in Gs[treatment]:
+                        Ainv_q -= self.Ainv_next(Gt, Ainv_q, BetaInv)
+
+                    # select next sample
+                    print(f"Picked {treatment}")
+                    break
+                else:
+                    print("Picked duplicate!")
+
+        ### Algorithm to continue improving design ###
+        while True:
+            # Find point that, when dropped, results in smallest decrease in EIG
+            f_L = []
+            for treatment in best_experiments:
+                # compute impact of losing this point
+                # | A - G' B G |
+                forgetCOV = self.compute_forgetCOV(Beta, Gs[treatment], Ainv_q)
+                f_L.append(self.fast_utility(forgetCOV))
+            worst_exp = best_experiments[np.argmax(f_L)]
+
+            # update parameter covariance given selected experiment
+            for Gt in Gs[worst_exp]:
+                Ainv_q -= self.Ainv_prev(Gt, Ainv_q, BetaInv)
+            print(f"Dropped {worst_exp}")
+
+            # Find next most informative point
+            f_I = []
+            for treatment in exp_names:
+                # compute impact of gaining new point
+                # | A + G' B G |
+                searchCOV = self.compute_searchCOV(Beta, Gs[treatment], Ainv_q)
+                f_I.append(self.fast_utility(searchCOV))
+            best_exp = design_space[np.argmax(f_I)][0]
+            # update parameter covariance given selected experiment
+            for Gt in Gs[best_exp]:
+                Ainv_q -= self.Ainv_next(Gt, Ainv_q, BetaInv)
+            print(f"Picked {best_exp}")
+
+            # If the dropped point is the same as the added point,
+            # or if the same point selected again, stop
+            if worst_exp == best_exp or best_exp in best_experiments:
+                return best_experiments, Ainv_q
+            else:
+                best_experiments.remove(worst_exp)
+                best_experiments.append(best_exp)
+
+        return best_experiments, Ainv_q
+
+    # compute utility of each experiment
+    def fast_utility(self, searchCOV):
+        # predicted objective + log det of prediction covariance over time series
+        # searchCOV has shape [n_out, n_out]
+        # log eig predCOV has shape [n_out]
+        # det predCOV is a scalar
+        return jnp.nansum(jnp.log(jnp.linalg.eigvalsh(searchCOV)))
