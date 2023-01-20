@@ -157,7 +157,7 @@ class ODE:
         self.verbose = verbose
 
         # set parameters of precision hyper-priors
-        self.a = 1e-5
+        self.a = 1e-4
         self.b = 1e-4
 
         # set posterior parameter precision and covariance to None
@@ -256,22 +256,25 @@ class ODE:
             return jnp.eye(n_t*n_y) - jnp.einsum("kl,li,ij,mj->km", block_diag(*[Beta]*n_t), Gaug, Ainv, Gaug)
         self.compute_forgetCOV = jit(compute_forgetCOV)
 
-    def fit(self, evidence_tol=1e-3, beta_tol=1e-3):
+    def fit(self, evidence_tol=1e-3, nlp_tol=1e-3, patience=3, max_fails=10):
         # estimate parameters using gradient descent
+        passes = 0
+        fails = 0
         convergence = np.inf
         previdence  = -np.inf
+        best_evidence = -np.inf
 
         # log of resource initial conditions are unbounded
         # bounds =  [(None, None) for _ in range(self.n_r)]
         # CR parameters are strictly non-negative
         # bounds = [(0., None) for _ in range(self.n_params)]
 
-        while convergence > evidence_tol:
+        while passes < patience or fails < max_fails:
             # update Alpha and Beta hyper-parameters
             self.update_precision()
             # fit using updated Alpha and Beta
             self.res = minimize(fun=self.objective, jac=self.jacobian, hess=self.hessian,
-                                x0=self.params, tol=beta_tol,
+                                x0=self.params, tol=nlp_tol,
                                 method='Newton-CG', callback=self.callback)
             if self.verbose:
                 print(self.res)
@@ -282,6 +285,14 @@ class ODE:
             self.update_evidence()
             # check convergence
             convergence = np.abs(previdence - self.evidence) / np.max([1.,np.abs(self.evidence)])
+            # update pass count
+            if convergence < evidence_tol:
+                passes += 1
+            # increment fails if convergence is negative
+            if self.evidence < best_evidence:
+                fails += 1
+            else:
+                best_evidence = np.copy(self.evidence) 
             # update evidence
             previdence = np.copy(self.evidence)
 
@@ -359,7 +370,7 @@ class ODE:
             self.Alpha = self.alpha_0*np.ones(self.n_params)
         else:
             # maximize complete data log-likelihood w.r.t. alpha and beta
-            self.alpha = self.n_params/(np.dot(self.params-self.prior, self.params-self.prior) + np.trace(self.Ainv) + 2.*self.a)
+            self.alpha = self.n_params/(np.sum((self.params-self.prior)**2) + np.trace(self.Ainv) + 2.*self.a)
             # self.Alpha = self.alpha*np.ones(self.n_params)
             self.Alpha = 1./((self.params-self.prior)**2 + np.diag(self.Ainv) + 2.*self.a)
 
@@ -394,7 +405,7 @@ class ODE:
             self.NLP += np.einsum('tk,kl,tl->', Y_error, self.Beta, Y_error)/2.
             self.RES += np.sum(Y_error)/self.n_total
 
-        # return NLP and gradient of NLP
+        # return NLP
         return self.NLP
 
     def jacobian(self, params):
@@ -430,12 +441,12 @@ class ODE:
             # sum over time and outputs to get gradient w.r.t params
             grad_NLP += self.eval_grad_NLP(Y_error, self.Beta, G)
 
-        # return NLP and gradient of NLP
+        # return gradient of NLP
         return grad_NLP
 
     def hessian(self, params):
 
-        # compute Hessian, covariance of y, sum of squares error
+        # compute Hessian of NLP
         self.A = np.diag(self.Alpha)
 
         # loop over each sample in dataset
@@ -464,7 +475,7 @@ class ODE:
         # make sure precision is symmetric
         self.A = (self.A + self.A.T)/2.
 
-        # return NLP and gradient of NLP
+        # return Hessian
         return self.A
 
     def update_covariance(self):
