@@ -256,7 +256,7 @@ class ODE:
             return jnp.eye(n_t*n_y) - jnp.einsum("kl,li,ij,mj->km", block_diag(*[Beta]*n_t), Gaug, Ainv, Gaug)
         self.compute_forgetCOV = jit(compute_forgetCOV)
 
-    def fit(self, evidence_tol=1e-3, nlp_tol=1e-3, patience=3, max_fails=10):
+    def fit(self, evidence_tol=1e-3, nlp_tol=1e-3, patience=3, max_fails=3):
         # estimate parameters using gradient descent
         passes = 0
         fails = 0
@@ -291,8 +291,10 @@ class ODE:
             # increment fails if convergence is negative
             if self.evidence < best_evidence:
                 fails += 1
+                print("Fail count ", fails)
             else:
-                best_evidence = np.copy(self.evidence) 
+                fails = 0
+                best_evidence = np.copy(self.evidence)
             # update evidence
             previdence = np.copy(self.evidence)
 
@@ -325,7 +327,7 @@ class ODE:
                     # N += len(series[::lag]) - 1
 
                     # Evidence optimization collapses with reduced N, so using full N instead
-                    N += len(series) - 1
+                    N += 1.*(len(series) - 1)
             assert k > 0, f"There are no time varying outputs in sample {treatment}"
             self.N += N / k
 
