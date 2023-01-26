@@ -18,7 +18,6 @@ from numpyro.infer import MCMC, NUTS, HMC
 from tqdm import tqdm
 
 import matplotlib.pyplot as plt
-from statsmodels.tsa.stattools import acf
 
 ### Basic usage ###
 
@@ -108,7 +107,7 @@ def process_df(df, species):
 
 class ODE:
     def __init__(self, system, dataframe, C, CRparams, r0, species,
-                 alpha_0=1., prior=None, verbose=True):
+                 alpha_0=1e-5, f_ind=1., prior=None, verbose=True):
         '''
         system: a system of differential equations
 
@@ -128,13 +127,13 @@ class ODE:
 
         # make sure params are 1-dimensional
         self.params = np.concatenate((r0, np.array(CRparams).ravel()))
-        if prior is not None:
-            self.prior = np.concatenate((r0, np.array(prior).ravel()))
-        else:
-            self.prior = np.zeros_like(self.params)
+        self.prior  = np.concatenate((-5.*np.ones_like(r0), np.array(prior).ravel()))
 
         # initial degree of regularization
         self.alpha_0 = alpha_0
+
+        # fraction of independent samples (N_eff = f_ind*N)
+        self.f_ind = f_ind
 
         # number of parameters
         self.n_s = len(species)
@@ -199,15 +198,16 @@ class ODE:
 
         # jit compile matrix operations
         def SSE_next(Y_error, CCTinv, G, Ainv):
-            return jnp.einsum('tk, kl, tl', Y_error, CCTinv, Y_error) + jnp.einsum('tki,ij,tlj->', G, Ainv, G)
+            return jnp.einsum('tk, kl, tl', Y_error, CCTinv, Y_error) + jnp.clip(jnp.einsum('tki,ij,tlj->', G, Ainv, G), 0., jnp.inf)
         self.SSE_next = jit(SSE_next)
 
         def yCOV_next(Y_error, G, Ainv):
-            return jnp.einsum('tk,tl->kl', Y_error, Y_error) + jnp.einsum('tki,ij,tlj->kl', G, Ainv, G)
+            return jnp.einsum('tk,tl->kl', Y_error, Y_error) + jnp.clip(jnp.einsum('tki,ij,tlj->kl', G, Ainv, G), 0., jnp.inf)
         self.yCOV_next = jit(yCOV_next)
 
         def A_next(G, Beta):
-            return jnp.einsum('tki, kl, tlj->ij', G, Beta, G)
+            A_n = jnp.einsum('tki, kl, tlj->ij', G, Beta, G)
+            return (A_n + A_n.T)/2.
         self.A_next = jit(A_next)
 
         # jit compile inverse Hessian computation step
@@ -227,7 +227,7 @@ class ODE:
         self.Ainv_prev = jit(Ainv_prev)
 
         def GAinvG(G, Ainv):
-            return jnp.einsum('tki,ij,tlj->tkl', G, Ainv, G)
+            return jnp.clip(jnp.einsum('tki,ij,tlj->tkl', G, Ainv, G), 0., jnp.inf)
         self.GAinvG = jit(GAinvG)
 
         def NewtonStep(A, g):
@@ -256,47 +256,67 @@ class ODE:
             return jnp.eye(n_t*n_y) - jnp.einsum("kl,li,ij,mj->km", block_diag(*[Beta]*n_t), Gaug, Ainv, Gaug)
         self.compute_forgetCOV = jit(compute_forgetCOV)
 
-    def fit(self, evidence_tol=1e-3, nlp_tol=1e-3, patience=3, max_fails=3):
+    def fit(self, evidence_tol=1e-3, nlp_tol=None, patience=2, max_fails=2):
         # estimate parameters using gradient descent
+        self.itr = 0
         passes = 0
         fails = 0
         convergence = np.inf
         previdence  = -np.inf
-        best_evidence = -np.inf
 
-        # log of resource initial conditions are unbounded
-        # bounds =  [(None, None) for _ in range(self.n_r)]
-        # CR parameters are strictly non-negative
-        # bounds = [(0., None) for _ in range(self.n_params)]
-
-        while passes < patience or fails < max_fails:
+        while passes < patience and fails < max_fails:
             # update Alpha and Beta hyper-parameters
             self.update_precision()
+
             # fit using updated Alpha and Beta
-            self.res = minimize(fun=self.objective, jac=self.jacobian, hess=self.hessian,
-                                x0=self.params, tol=nlp_tol,
-                                method='Newton-CG', callback=self.callback)
+            self.res = minimize(fun=self.objective,
+                                jac=self.jacobian,
+                                hess=self.hessian,
+                                x0=self.params,
+                                tol=nlp_tol,
+                                method='Newton-CG',
+                                callback=self.callback)
             if self.verbose:
                 print(self.res)
             self.params = self.res.x
+
             # update covariance
             self.update_covariance()
+
+            # make sure that precision is positive-definite
+            p_eigs = np.linalg.eigvalsh(self.A)
+            gap = np.abs(np.clip(np.min(p_eigs), -np.inf, 0.))
+            if gap > 0: print("Hessian not positive definite, increasing regularization...")
+            while gap > 0:
+                # increase prior precision
+                self.Alpha *= 1.10
+                self.update_covariance()
+                p_eigs = np.linalg.eigvalsh(self.A)
+                gap = np.abs(np.clip(np.min(p_eigs), -np.inf, 0.))
+
             # update evidence
             self.update_evidence()
+
             # check convergence
             convergence = np.abs(previdence - self.evidence) / np.max([1.,np.abs(self.evidence)])
+
             # update pass count
             if convergence < evidence_tol:
                 passes += 1
+                print("Pass count ", passes)
+            else:
+                passes = 0
+
             # increment fails if convergence is negative
-            if self.evidence < best_evidence:
+            if self.evidence < previdence:
                 fails += 1
                 print("Fail count ", fails)
             else:
                 fails = 0
-                best_evidence = np.copy(self.evidence)
+
             # update evidence
             previdence = np.copy(self.evidence)
+            self.itr += 1
 
     # EM algorithm to update hyper-parameters
     def update_precision(self):
@@ -327,7 +347,7 @@ class ODE:
                     # N += len(series[::lag]) - 1
 
                     # Evidence optimization collapses with reduced N, so using full N instead
-                    N += 1.*(len(series) - 1)
+                    N += self.f_ind*(len(series) - 1)
             assert k > 0, f"There are no time varying outputs in sample {treatment}"
             self.N += N / k
 
@@ -371,14 +391,17 @@ class ODE:
             self.alpha = self.alpha_0
             self.Alpha = self.alpha_0*np.ones(self.n_params)
         else:
+            # compute diagonal of covariance
+            Ainv_diag = np.clip(np.diag(self.Ainv), 0., np.inf)
+
             # maximize complete data log-likelihood w.r.t. alpha and beta
-            self.alpha = self.n_params/(np.sum((self.params-self.prior)**2) + np.trace(self.Ainv) + 2.*self.a)
+            self.alpha = self.n_params/(np.sum((self.params-self.prior)**2) + np.sum(Ainv_diag) + 2.*self.a)
             # self.Alpha = self.alpha*np.ones(self.n_params)
-            self.Alpha = 1./((self.params-self.prior)**2 + np.diag(self.Ainv) + 2.*self.a)
+            self.Alpha = 1./((self.params-self.prior)**2 + Ainv_diag + 2.*self.a)
 
             # update output precision
             self.beta = self.n_total / (SSE + 2.*self.b)
-            self.Beta = self.N*np.linalg.inv(yCOV + 2.*self.b*self.C.shape[0])
+            self.Beta = self.N*np.linalg.inv(yCOV + 2.*self.b*np.eye(self.C.shape[0]))
             self.Beta = (self.Beta + self.Beta.T)/2.
             self.BetaInv = np.linalg.inv(self.Beta)
 
@@ -527,11 +550,11 @@ class ODE:
         p_eigs = np.linalg.eigvalsh(self.A)
 
         # compute evidence
-        self.evidence = np.sum(np.log(self.Alpha))/2. - \
-                        np.sum(np.log(p_eigs[p_eigs>0.]))/2. - \
-                        self.NLP + self.N*np.sum(np.log(np.linalg.eigvalsh(self.Beta)))/2.
+        self.evidence = np.nansum(np.log(self.Alpha))/2. - \
+                        np.nansum(np.log(p_eigs[p_eigs>0]))/2. - \
+                        self.NLP + self.N*np.nansum(np.log(np.linalg.eigvalsh(self.Beta)))/2.
 
-        # loop over precision matrices from each dataset
+        # print evidence
         if self.verbose:
             print("Evidence {:.3f}".format(self.evidence))
 
@@ -611,3 +634,16 @@ class ODE:
         stdv = np.sqrt(get_diag(covariance))
 
         return Y_predicted, stdv, covariance
+
+    # function to predict from posterior samples
+    def predict_MC(self, x_test, t_eval, n_samples=100):
+
+        # monte carlo draws from posterior
+        L = np.linalg.cholesky(self.Ainv)
+        z = np.random.randn(n_samples, self.n_params)
+        posterior_params = self.params + np.einsum('jk,ik->ij', L, z)
+
+        # make point predictions of shape [n_mcmc, n_samples, n_time, n_outputs]
+        preds = vmap(lambda params: np.nan_to_num(self.runODE(t_eval, Y_measured[0], params[:self.n_r], params[self.n_r:])), (0,))(posterior_params)
+
+        return preds
