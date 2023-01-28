@@ -286,13 +286,16 @@ class ODE:
             # make sure that precision is positive-definite
             p_eigs = np.linalg.eigvalsh(self.A)
             gap = np.abs(np.clip(np.min(p_eigs), -np.inf, 0.))
+            eps = 0.
             if gap > 0: print("Hessian not positive definite, increasing regularization...")
             while gap > 0:
                 # increase prior precision
-                self.Alpha *= 1.10
-                self.update_covariance()
-                p_eigs = np.linalg.eigvalsh(self.A)
+                eps += .5
+                p_eigs += eps*self.Alpha
                 gap = np.abs(np.clip(np.min(p_eigs), -np.inf, 0.))
+            if eps > 0.:
+                self.Alpha += eps*self.Alpha
+                self.update_covariance()
 
             # update evidence
             self.update_evidence()
@@ -382,7 +385,7 @@ class ODE:
         self.n_total = self.N*self.C.shape[0]
 
         if self.A is None:
-            # init ouptut precision
+            # init output precision
             self.beta = 1.
             self.Beta = np.eye(self.C.shape[0])
             self.BetaInv = np.eye(self.C.shape[0])

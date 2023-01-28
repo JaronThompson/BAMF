@@ -92,7 +92,7 @@ def process_df(df, sys_vars, measured_vars, controls):
 
 class ODE:
     def __init__(self, system, dataframes, C, params, sys_vars, measured_vars, controls = [],
-                 alpha_0=1., prior=None, verbose=True):
+                 alpha_0=1e-5, prior=None, verbose=True):
         '''
         system: a system of differential equations
 
@@ -144,7 +144,7 @@ class ODE:
         self.verbose = verbose
 
         # set parameters of precision hyper-priors
-        self.a = 1e-3
+        self.a = 1e-4
         self.b = 1e-4
 
         # set posterior parameter precision and covariance to None
