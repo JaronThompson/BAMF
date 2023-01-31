@@ -98,7 +98,7 @@ def runODEZ(t_eval, s0, r0, CRparams, dXZ_dt):
 def process_df(df, species):
 
     # store measured datasets for quick access
-    data = {}
+    data = []
     for treatment, comm_data in df.groupby("Treatments"):
 
         # make sure comm_data is sorted in chronological order
@@ -111,11 +111,7 @@ def process_df(df, species):
         Y_measured = np.array(comm_data[species].values, float)
 
         # append t_eval and Y_measured to data list
-        if len(t_eval) not in data.keys():
-            data[len(t_eval)] = (treatment, t_eval, np.expand_dims(Y_measured, 0))
-        else:
-            Y_measured = np.concatenate((np.expand_dims(Y_measured, 0), data[len(t_eval)][-1]))
-            data[len(t_eval)] = (treatment, t_eval, Y_measured)
+        data.append([treatment, t_eval, Y_measured])
 
     return data
 
@@ -384,29 +380,27 @@ class ODE:
         self.N = 0
 
         # loop over each sample in dataset
-        for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
+        for treatment, t_eval, Y_measured in self.dataset:
+            # count effective number of uncorrelated observations
+            # self.N += len(t_eval[1:]) * np.sum(np.sum(Y_measured, 0) > 0) / self.C.shape[0]
+            k = 0 # number of outputs
+            N = 0 # number of samples
+            for series in Y_measured.T:
+                # check if there is any variation in the series
+                if np.std(series) > 0:
+                    # count number of outputs that vary over time
+                    k += 1
 
-            for Y_measured in Y_batch:
-                # count effective number of uncorrelated observations
-                # self.N += len(t_eval[1:]) * np.sum(np.sum(Y_measured, 0) > 0) / self.C.shape[0]
-                k = 0 # number of outputs
-                N = 0 # number of samples
-                for series in Y_measured.T:
-                    # check if there is any variation in the series
-                    if np.std(series) > 0:
-                        # count number of outputs that vary over time
-                        k += 1
+                    # determine lag between uncorrelated samples
+                    # lag = [i for i,j in enumerate(acf(series) < .5) if j][0]
 
-                        # determine lag between uncorrelated samples
-                        # lag = [i for i,j in enumerate(acf(series) < .5) if j][0]
+                    # count number of uncorrelated samples in series
+                    # N += len(series[::lag]) - 1
 
-                        # count number of uncorrelated samples in series
-                        # N += len(series[::lag]) - 1
-
-                        # Evidence optimization collapses with reduced N, so using full N instead
-                        N += self.f_ind*(len(series) - 1)
-                assert k > 0, f"There are no time varying outputs in sample {treatment}"
-                self.N += N / k
+                    # Evidence optimization collapses with reduced N, so using full N instead
+                    N += self.f_ind*(len(series) - 1)
+            assert k > 0, f"There are no time varying outputs in sample {treatment}"
+            self.N += N / k
 
         # init output precision
         self.n_total = self.N*self.C.shape[0]
@@ -431,37 +425,34 @@ class ODE:
         yCOV = 0.
 
         # loop over each sample in dataset
-        for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
+        for treatment, t_eval, Y_measured in self.dataset:
 
-            # faster to not evaluate in batches
-            for Y_measured in Y_batch:
+            # run model using current parameters, output = [n_time, self.n_sys_vars]
+            # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
 
-                # run model using current parameters, output = [n_time, self.n_sys_vars]
-                # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
+            # for each output in the batch
+            output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:]))
 
-                # for each output in the batch
-                output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:]))
+            # keep only observed predictions
+            Y_predicted = np.einsum('ck,tk->tc', self.C, output[1:, :self.n_sys_vars])
 
-                # keep only observed predictions
-                Y_predicted = np.einsum('ck,tk->tc', self.C, output[1:, :self.n_sys_vars])
+            # collect gradients and reshape
+            GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
+                             [len(t_eval)-1, self.n_sys_vars, self.n_r])
 
-                # collect gradients and reshape
-                GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
-                                 [len(t_eval)-1, self.n_sys_vars, self.n_r])
+            # collect gradients and reshape
+            GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
+                             [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
 
-                # collect gradients and reshape
-                GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
-                                 [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
+            # stack gradient matrices
+            G = np.concatenate((GZ0, GZ), axis=-1)
 
-                # stack gradient matrices
-                G = np.concatenate((GZ0, GZ), axis=-1)
+            # compress model gradient
+            G = np.einsum('ck,tki->tci', self.C, G)
 
-                # compress model gradient
-                G = np.einsum('ck,tki->tci', self.C, G)
-
-                # Determine SSE
-                Y_error = Y_predicted - Y_measured[1:]
-                yCOV += self.yCOV_next(Y_error, G, Linv)
+            # Determine SSE
+            Y_error = Y_predicted - Y_measured[1:]
+            yCOV += self.yCOV_next(Y_error, G, Linv)
 
         ### M step: update hyper-parameters ###
 
@@ -486,27 +477,24 @@ class ODE:
         self.RES = 0.
 
         # loop over each sample in dataset
-        for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
+        for treatment, t_eval, Y_measured in self.dataset:
 
-            # faster to not evaluate in batches
-            for Y_measured in Y_batch:
+            # run model in batches
+            # for batch_inds in np.array_split(np.arange(n_samples), n_samples//self.batch_size):
+            # outputs = np.nan_to_num(self.batchODE(t_eval, Y_batch[batch_inds], params[:self.n_r], params[self.n_r:]))
 
-                # run model in batches
-                # for batch_inds in np.array_split(np.arange(n_samples), n_samples//self.batch_size):
-                # outputs = np.nan_to_num(self.batchODE(t_eval, Y_batch[batch_inds], params[:self.n_r], params[self.n_r:]))
+            # for each output
+            output = np.nan_to_num(self.runODE(t_eval, Y_measured, params[:self.n_r], params[self.n_r:]))
 
-                # for each output
-                output = np.nan_to_num(self.runODE(t_eval, Y_measured, params[:self.n_r], params[self.n_r:]))
+            # only observe species
+            Y_predicted = np.einsum('ck,tk->tc', self.C, output[1:, :self.n_sys_vars])
 
-                # only observe species
-                Y_predicted = np.einsum('ck,tk->tc', self.C, output[1:, :self.n_sys_vars])
+            # Determine error
+            Y_error = Y_predicted - Y_measured[1:]
 
-                # Determine error
-                Y_error = Y_predicted - Y_measured[1:]
-
-                # Determine SSE and gradient of SSE
-                self.NLP += np.einsum('tk,kl,tl->', Y_error, self.Beta, Y_error)/2.
-                self.RES += np.sum(Y_error)/self.n_total
+            # Determine SSE and gradient of SSE
+            self.NLP += np.einsum('tk,kl,tl->', Y_error, self.Beta, Y_error)/2.
+            self.RES += np.sum(Y_error)/self.n_total
 
         # return NLP
         return self.NLP
@@ -517,49 +505,46 @@ class ODE:
         grad_NLP = self.Alpha*(params-self.prior)
 
         # loop over each sample in dataset
-        for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
+        for treatment, t_eval, Y_measured in self.dataset:
 
-            # for each sample in the batch
-            for Y_measured in Y_batch:
+            ### Using vmap to integrate ODEs in parallel seems to be slower?
+            # for batch_inds in np.array_split(np.arange(n_samples), n_samples//self.batch_size):
+            # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
 
-                ### Using vmap to integrate ODEs seems to be slower?
-                # for batch_inds in np.array_split(np.arange(n_samples), n_samples//self.batch_size):
-                # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
+            ### Adjoint sensitivity method also seems to be slower?
+            # output = np.nan_to_num(self.runODE(t_eval, Y_measured[0], params[:self.n_r], params[self.n_r:]))
+            #
+            # # adjoint at measured time points
+            # at = self.adjoint(output, Y_measured, self.Beta)
+            #
+            # # gradient of NLP
+            # grad_NLP += np.sum(self.batchODEA(t_eval[1:], output[1:], at[1:], params[self.n_r:]), 0)
 
-                ### Adjoint sensitivity method also seems to be slower?
-                # output = np.nan_to_num(self.runODE(t_eval, Y_measured[0], params[:self.n_r], params[self.n_r:]))
-                #
-                # # adjoint at measured time points
-                # at = self.adjoint(output, Y_measured, self.Beta)
-                #
-                # # gradient of NLP
-                # grad_NLP += np.sum(self.batchODEA(t_eval[1:], output[1:], at[1:], params[self.n_r:]), 0)
+            # for each output
+            output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, params[:self.n_r], params[self.n_r:]))
 
-                # for each output
-                output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, params[:self.n_r], params[self.n_r:]))
+            # only observe species
+            Y_predicted = np.einsum('ck,tk->tc', self.C, output[1:, :self.n_sys_vars])
 
-                # only observe species
-                Y_predicted = np.einsum('ck,tk->tc', self.C, output[1:, :self.n_sys_vars])
+            # collect gradients and reshape
+            GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
+                             [len(t_eval)-1, self.n_sys_vars, self.n_r])
 
-                # collect gradients and reshape
-                GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
-                                 [len(t_eval)-1, self.n_sys_vars, self.n_r])
+            # collect gradients and reshape
+            GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
+                             [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
 
-                # collect gradients and reshape
-                GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
-                                 [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
+            # stack gradient matrices
+            G = np.concatenate((GZ0, GZ), axis=-1)
 
-                # stack gradient matrices
-                G = np.concatenate((GZ0, GZ), axis=-1)
+            # compress model gradient
+            G = np.einsum('ck,tki->tci', self.C, G)
 
-                # compress model gradient
-                G = np.einsum('ck,tki->tci', self.C, G)
+            # Determine error
+            Y_error = Y_predicted - Y_measured[1:]
 
-                # Determine error
-                Y_error = Y_predicted - Y_measured[1:]
-
-                # sum over time and outputs to get gradient w.r.t params
-                grad_NLP += self.eval_grad_NLP(Y_error, self.Beta, G)
+            # sum over time and outputs to get gradient w.r.t params
+            grad_NLP += self.eval_grad_NLP(Y_error, self.Beta, G)
 
         # return gradient of NLP
         return grad_NLP
@@ -570,34 +555,31 @@ class ODE:
         self.A = np.diag(self.Alpha)
 
         # loop over each sample in dataset
-        for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
+        for treatment, t_eval, Y_measured in self.dataset:
 
-            # faster to not evaluate in batches
-            for Y_measured in Y_batch:
+            # run model in batches
+            # for batch_inds in np.array_split(np.arange(n_samples), n_samples//self.batch_size):
+            # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], params[:self.n_r], params[self.n_r:]))
 
-                # run model in batches
-                # for batch_inds in np.array_split(np.arange(n_samples), n_samples//self.batch_size):
-                # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], params[:self.n_r], params[self.n_r:]))
+            # for each output
+            output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, params[:self.n_r], params[self.n_r:]))
 
-                # for each output
-                output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, params[:self.n_r], params[self.n_r:]))
+            # collect gradients and reshape
+            GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
+                             [len(t_eval)-1, self.n_sys_vars, self.n_r])
 
-                # collect gradients and reshape
-                GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
-                                 [len(t_eval)-1, self.n_sys_vars, self.n_r])
+            # collect gradients and reshape
+            GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
+                             [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
 
-                # collect gradients and reshape
-                GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
-                                 [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
+            # stack gradient matrices
+            G = np.concatenate((GZ0, GZ), axis=-1)
 
-                # stack gradient matrices
-                G = np.concatenate((GZ0, GZ), axis=-1)
+            # compress model gradient
+            G = np.einsum('ck,tki->tci', self.C, G)
 
-                # compress model gradient
-                G = np.einsum('ck,tki->tci', self.C, G)
-
-                # compute Hessian
-                self.A += self.A_next(G, self.Beta)
+            # compute Hessian
+            self.A += self.A_next(G, self.Beta)
 
         # make sure precision is symmetric
         self.A = (self.A + self.A.T)/2.
@@ -610,34 +592,31 @@ class ODE:
         self.A = np.diag(self.Alpha)
 
         # loop over each sample in dataset
-        for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
+        for treatment, t_eval, Y_measured in self.dataset:
 
-            # faster to not evaluate in batches
-            for Y_measured in Y_batch:
+            # run model in batches
+            # for batch_inds in np.array_split(np.arange(n_samples), n_samples//self.batch_size):
+            # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
 
-                # run model in batches
-                # for batch_inds in np.array_split(np.arange(n_samples), n_samples//self.batch_size):
-                # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
+            # for each output
+            output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:]))
 
-                # for each output
-                output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:]))
+            # collect gradients and reshape
+            GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
+                             [len(t_eval)-1, self.n_sys_vars, self.n_r])
 
-                # collect gradients and reshape
-                GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
-                                 [len(t_eval)-1, self.n_sys_vars, self.n_r])
+            # collect gradients and reshape
+            GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
+                             [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
 
-                # collect gradients and reshape
-                GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
-                                 [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
+            # stack gradient matrices
+            G = np.concatenate((GZ0, GZ), axis=-1)
 
-                # stack gradient matrices
-                G = np.concatenate((GZ0, GZ), axis=-1)
+            # compress model gradient
+            G = np.einsum('ck,tki->tci', self.C, G)
 
-                # compress model gradient
-                G = np.einsum('ck,tki->tci', self.C, G)
-
-                # compute Hessian
-                self.A += self.A_next(G, self.Beta)
+            # compute Hessian
+            self.A += self.A_next(G, self.Beta)
 
         # Laplace approximation of posterior precision
         self.A = (self.A + self.A.T)/2.
@@ -646,40 +625,37 @@ class ODE:
         ### Approximate / fast method ###
         self.Linv = self.compute_Linv(self.A)
 
-        ### Exact / slow method ###
+        ### More accurate / slow method ###
         # # update parameter covariance matrix given current parameter estimate
         # self.Ainv = np.diag(1./self.Alpha)
         #
         # # loop over each sample in dataset
-        # for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
+        # for treatment, t_eval, Y_measured in self.dataset:
         #
-        #     # faster to not evaluate in batches
-        #     for Y_measured in Y_batch:
+        #     # run model in batches
+        #     # for batch_inds in np.array_split(np.arange(n_samples), n_samples//self.batch_size):
+        #     # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
         #
-        #         # run model in batches
-        #         # for batch_inds in np.array_split(np.arange(n_samples), n_samples//self.batch_size):
-        #         # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
+        #     # for each output
+        #     output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:]))
         #
-        #         # for each output
-        #         output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:]))
+        #     # collect gradients and reshape
+        #     GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
+        #                      [len(t_eval)-1, self.n_sys_vars, self.n_r])
         #
-        #         # collect gradients and reshape
-        #         GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
-        #                          [len(t_eval)-1, self.n_sys_vars, self.n_r])
+        #     # collect gradients and reshape
+        #     GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
+        #                      [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
         #
-        #         # collect gradients and reshape
-        #         GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
-        #                          [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
+        #     # stack gradient matrices
+        #     G = np.concatenate((GZ0, GZ), axis=-1)
         #
-        #         # stack gradient matrices
-        #         G = np.concatenate((GZ0, GZ), axis=-1)
+        #     # compress model gradient
+        #     G = np.einsum('ck,tki->tci', self.C, G)
         #
-        #         # compress model gradient
-        #         G = np.einsum('ck,tki->tci', self.C, G)
-        #
-        #         # compute covariance
-        #         for Gt in G:
-        #             self.Ainv -= self.Ainv_next(Gt, self.Ainv, self.BetaInv)
+        #     # compute covariance
+        #     for Gt in G:
+        #         self.Ainv -= self.Ainv_next(Gt, self.Ainv, self.BetaInv)
         #
         # # Laplace approximation of posterior covariance
         # self.Ainv = (self.Ainv + self.Ainv.T)/2.
