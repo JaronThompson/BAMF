@@ -112,10 +112,10 @@ def process_df(df, species):
 
         # append t_eval and Y_measured to data list
         if len(t_eval) not in data.keys():
-            data[len(t_eval)] = [t_eval, np.expand_dims(Y_measured, 0)]
+            data[len(t_eval)] = (treatment, t_eval, np.expand_dims(Y_measured, 0))
         else:
-            Y_measured = np.concatenate((np.expand_dims(Y_measured, 0), data[len(t_eval)][1]))
-            data[len(t_eval)] = [t_eval, Y_measured]
+            Y_measured = np.concatenate((np.expand_dims(Y_measured, 0), data[len(t_eval)][-1]))
+            data[len(t_eval)] = (treatment, t_eval, Y_measured)
 
     return data
 
@@ -235,18 +235,18 @@ class ODE:
         self.runODEA = jit(lambda t_eval, xt, at, CRparams: runODEA(t_eval, xt, at, CRparams, self.dXA_dt))
         self.batchODEA = jit(vmap(lambda t, out, a, p: self.runODEA(jnp.array([0., t]), out, a, p)[self.n_sys_vars+self.n_s:], (0, 0, 0, None)))
 
-        # jit compile matrix operations
-        def SSE_next(Y_error, CCTinv, G, Ainv):
-            return jnp.einsum('tk, kl, tl', Y_error, CCTinv, Y_error) + jnp.clip(jnp.einsum('tki,ij,tlj->', G, Ainv, G), 0., jnp.inf)
-        self.SSE_next = jit(SSE_next)
+        def GAinvG(G, Linv):
+            return jnp.einsum("tij,kj,kl,tml->tim", G, Linv, Linv, G)
+        self.GAinvG = jit(GAinvG)
 
-        def yCOV_next(Y_error, G, Ainv):
-            return jnp.einsum('tk,tl->kl', Y_error, Y_error) + jnp.clip(jnp.einsum('tki,ij,tlj->kl', G, Ainv, G), 0., jnp.inf)
+        def yCOV_next(Y_error, G, Linv):
+            return jnp.einsum('tk,tl->kl', Y_error, Y_error) + jnp.sum(self.GAinvG(G, Linv), 0)
         self.yCOV_next = jit(yCOV_next)
 
         def A_next(G, Beta):
             A_n = jnp.einsum('tki, kl, tlj->ij', G, Beta, G)
-            return (A_n + A_n.T)/2.
+            A_n = (A_n + A_n.T)/2.
+            return A_n
         self.A_next = jit(A_next)
 
         # jit compile inverse Hessian computation step
@@ -265,9 +265,21 @@ class ODE:
             return Ainv_step
         self.Ainv_prev = jit(Ainv_prev)
 
-        def GAinvG(G, Ainv):
-            return jnp.clip(jnp.einsum('tki,ij,tlj->tkl', G, Ainv, G), 0., jnp.inf)
-        self.GAinvG = jit(GAinvG)
+        # jit compile function to compute log of determinant of a matrix
+        def log_det(A):
+            L = jnp.linalg.cholesky(A)
+            return 2*jnp.sum(jnp.log(jnp.diag(L)))
+        self.log_det = jit(log_det)
+
+        # compute inverse of L where A = LL^T
+        def compute_Linv(A):
+            return jnp.linalg.inv(jnp.linalg.cholesky(A))
+        self.compute_Linv = jit(compute_Linv)
+
+        # jit compile function to approximate diagonal of covariance
+        def Ainv_diag(Linv):
+            return jnp.diag(Linv.T@Linv)
+        self.Ainv_diag = jit(Ainv_diag)
 
         def NewtonStep(A, g):
             return jnp.linalg.solve(A,g)
@@ -278,7 +290,7 @@ class ODE:
         self.eval_grad_NLP = jit(eval_grad_NLP)
 
         # jit compile prediction covariance computation
-        def compute_searchCOV(Beta, G, Ainv):
+        def compute_searchCOV(Beta, G, Linv):
             # dimensions of sample
             n_t, n_y, n_theta = G.shape
             # stack G over time points [n, n_t, n_out, n_theta]--> [n, n_t*n_out, n_theta]
@@ -295,7 +307,7 @@ class ODE:
             return jnp.eye(n_t*n_y) - jnp.einsum("kl,li,ij,mj->km", block_diag(*[Beta]*n_t), Gaug, Ainv, Gaug)
         self.compute_forgetCOV = jit(compute_forgetCOV)
 
-    def fit(self, evidence_tol=1e-3, nlp_tol=None, patience=2, max_fails=2):
+    def fit(self, evidence_tol=1e-3, nlp_tol=None, patience=2, max_fails=2, beta=1e-3):
         # estimate parameters using gradient descent
         self.itr = 0
         passes = 0
@@ -303,9 +315,12 @@ class ODE:
         convergence = np.inf
         previdence  = -np.inf
 
+        # initialize hyper parameters
+        self.init_hypers()
+
         while passes < patience and fails < max_fails:
             # update Alpha and Beta hyper-parameters
-            self.update_precision()
+            if self.itr>0: self.update_hypers()
 
             # fit using updated Alpha and Beta
             self.res = minimize(fun=self.objective,
@@ -320,24 +335,24 @@ class ODE:
             self.params = self.res.x
 
             # update covariance
-            self.update_covariance()
+            self.update_precision()
 
-            # make sure that precision is positive-definite
-            p_eigs = np.linalg.eigvalsh(self.A)
-            gap = np.abs(np.clip(np.min(p_eigs), -np.inf, 0.))
-            eps = 0.
-            if gap > 0: print("Hessian not positive definite, increasing regularization...")
-            while gap > 0:
+            # make sure that precision is positive definite (algorithm 3.3 in Numerical Optimization)
+            if np.min(np.diag(self.A)) > 0:
+                tau = 0.
+            else:
+                tau = beta - np.min(np.diag(self.A))
+
+            # increase precision of prior until posterior precision is positive definite
+            self.A += tau*np.diag(self.Alpha)
+            while jnp.isnan(jnp.linalg.cholesky(self.A)).any():
                 # increase prior precision
-                eps += .5
-                p_eigs += eps*self.Alpha
-                gap = np.abs(np.clip(np.min(p_eigs), -np.inf, 0.))
-            if eps > 0.:
-                self.Alpha += eps*self.Alpha
-                self.update_covariance()
+                tau = np.max([2*tau, beta])
+                self.A += tau*np.diag(self.Alpha)
 
             # update evidence
             self.update_evidence()
+            assert not np.isnan(self.evidence), "Evidence is NaN! Something went wrong."
 
             # check convergence
             convergence = np.abs(previdence - self.evidence) / np.max([1.,np.abs(self.evidence)])
@@ -360,17 +375,16 @@ class ODE:
             previdence = np.copy(self.evidence)
             self.itr += 1
 
-    # EM algorithm to update hyper-parameters
-    def update_precision(self):
-        print("Updating precision...")
+        # finally compute covariance (Hessian inverse)
+        self.update_covariance()
 
-        # init sse and n
-        SSE = 0.
-        yCOV = 0.
+    def init_hypers(self):
+
+        # count number of samples
         self.N = 0
 
         # loop over each sample in dataset
-        for n_t, (t_eval, Y_batch) in self.dataset.items():
+        for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
 
             for Y_measured in Y_batch:
                 # count effective number of uncorrelated observations
@@ -394,73 +408,76 @@ class ODE:
                 assert k > 0, f"There are no time varying outputs in sample {treatment}"
                 self.N += N / k
 
-            # run model using current parameters
-            if self.A is not None:
-                # loop over each sample in dataset
-                for n_t, (t_eval, Y_batch) in self.dataset.items():
+        # init output precision
+        self.n_total = self.N*self.C.shape[0]
+        self.Beta = np.eye(self.C.shape[0])
+        self.BetaInv = np.eye(self.C.shape[0])
 
-                    # faster to not evaluate in batches
-                    for Y_measured in Y_batch:
+        # initial guess of parameter precision
+        self.alpha = self.alpha_0
+        self.Alpha = self.alpha_0*np.ones(self.n_params)
 
-                        # run model using current parameters, output = [n_time, self.n_sys_vars]
-                        # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
+        if self.verbose:
+            print("Total samples: {:.0f}, Updated regularization: {:.2e}".format(self.N, self.alpha))
 
-                        # for each output in the batch
-                        output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:]))
+    # EM algorithm to update hyper-parameters
+    def update_hypers(self):
+        print("Updating precision...")
 
-                        # keep only observed predictions
-                        Y_predicted = np.einsum('ck,tk->tc', self.C, output[1:, :self.n_sys_vars])
+        # compute inverse of cholesky decomposed precision matrix
+        Linv = self.compute_Linv(self.A)
 
-                        # collect gradients and reshape
-                        GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
-                                         [len(t_eval)-1, self.n_sys_vars, self.n_r])
+        # init yCOV
+        yCOV = 0.
 
-                        # collect gradients and reshape
-                        GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
-                                         [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
+        # loop over each sample in dataset
+        for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
 
-                        # stack gradient matrices
-                        G = np.concatenate((GZ0, GZ), axis=-1)
+            # faster to not evaluate in batches
+            for Y_measured in Y_batch:
 
-                        # compress model gradient
-                        G = np.einsum('ck,tki->tci', self.C, G)
+                # run model using current parameters, output = [n_time, self.n_sys_vars]
+                # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
 
-                        # Determine SSE
-                        Y_error = Y_predicted - Y_measured[1:]
-                        SSE  += self.SSE_next(Y_error, self.CCTinv, G, self.Ainv)
-                        yCOV += self.yCOV_next(Y_error, G, self.Ainv)
+                # for each output in the batch
+                output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:]))
+
+                # keep only observed predictions
+                Y_predicted = np.einsum('ck,tk->tc', self.C, output[1:, :self.n_sys_vars])
+
+                # collect gradients and reshape
+                GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
+                                 [len(t_eval)-1, self.n_sys_vars, self.n_r])
+
+                # collect gradients and reshape
+                GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
+                                 [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
+
+                # stack gradient matrices
+                G = np.concatenate((GZ0, GZ), axis=-1)
+
+                # compress model gradient
+                G = np.einsum('ck,tki->tci', self.C, G)
+
+                # Determine SSE
+                Y_error = Y_predicted - Y_measured[1:]
+                yCOV += self.yCOV_next(Y_error, G, Linv)
 
         ### M step: update hyper-parameters ###
 
-        # update target precision
-        self.n_total = self.N*self.C.shape[0]
+        # maximize complete data log-likelihood w.r.t. alpha and beta
+        Ainv_ii = self.Ainv_diag(Linv)
+        self.alpha = self.n_params/(np.sum((self.params-self.prior)**2) + np.sum(Ainv_ii) + 2.*self.a)
+        self.Alpha = self.alpha*np.ones(self.n_params)
+        # self.Alpha = 1./((self.params-self.prior)**2 + Ainv_ii + 2.*self.a)
 
-        if self.A is None:
-            # init output precision
-            self.beta = 1.
-            self.Beta = np.eye(self.C.shape[0])
-            self.BetaInv = np.eye(self.C.shape[0])
-
-            # initial guess of parameter precision
-            self.alpha = self.alpha_0
-            self.Alpha = self.alpha_0*np.ones(self.n_params)
-        else:
-            # compute diagonal of covariance
-            Ainv_diag = np.clip(np.diag(self.Ainv), 0., np.inf)
-
-            # maximize complete data log-likelihood w.r.t. alpha and beta
-            self.alpha = self.n_params/(np.sum((self.params-self.prior)**2) + np.sum(Ainv_diag) + 2.*self.a)
-            # self.Alpha = self.alpha*np.ones(self.n_params)
-            self.Alpha = 1./((self.params-self.prior)**2 + Ainv_diag + 2.*self.a)
-
-            # update output precision
-            self.beta = self.n_total / (SSE + 2.*self.b)
-            self.Beta = self.N*np.linalg.inv(yCOV + 2.*self.b*np.eye(self.C.shape[0]))
-            self.Beta = (self.Beta + self.Beta.T)/2.
-            self.BetaInv = np.linalg.inv(self.Beta)
+        # update output precision
+        self.Beta = self.N*np.linalg.inv(yCOV + 2.*self.b*np.eye(self.C.shape[0]))
+        self.Beta = (self.Beta + self.Beta.T)/2.
+        self.BetaInv = np.linalg.inv(self.Beta)
 
         if self.verbose:
-            print("Total samples: {:.0f}, Updated regularization: {:.2e}".format(self.n_total, self.alpha/self.beta))
+            print("Total samples: {:.0f}, Updated regularization: {:.2e}".format(self.N, self.alpha))
 
     def objective(self, params):
         # compute negative log posterior (NLP)
@@ -469,7 +486,7 @@ class ODE:
         self.RES = 0.
 
         # loop over each sample in dataset
-        for n_t, (t_eval, Y_batch) in self.dataset.items():
+        for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
 
             # faster to not evaluate in batches
             for Y_measured in Y_batch:
@@ -500,7 +517,7 @@ class ODE:
         grad_NLP = self.Alpha*(params-self.prior)
 
         # loop over each sample in dataset
-        for n_t, (t_eval, Y_batch) in self.dataset.items():
+        for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
 
             # for each sample in the batch
             for Y_measured in Y_batch:
@@ -553,7 +570,7 @@ class ODE:
         self.A = np.diag(self.Alpha)
 
         # loop over each sample in dataset
-        for n_t, (t_eval, Y_batch) in self.dataset.items():
+        for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
 
             # faster to not evaluate in batches
             for Y_measured in Y_batch:
@@ -588,17 +605,12 @@ class ODE:
         # return Hessian
         return self.A
 
-    def update_covariance(self):
+    def update_precision(self):
         # update parameter covariance matrix given current parameter estimate
-        if self.A is None:
-            self.A = self.alpha_0*np.eye(self.n_params)
-            self.Ainv = np.eye(self.n_params)/self.alpha_0
-        else:
-            self.A = np.diag(self.Alpha)
-            self.Ainv = np.diag(1./self.Alpha)
+        self.A = np.diag(self.Alpha)
 
         # loop over each sample in dataset
-        for n_t, (t_eval, Y_batch) in self.dataset.items():
+        for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
 
             # faster to not evaluate in batches
             for Y_measured in Y_batch:
@@ -627,23 +639,57 @@ class ODE:
                 # compute Hessian
                 self.A += self.A_next(G, self.Beta)
 
-                # compute covariance
-                for Gt in G:
-                    self.Ainv -= self.Ainv_next(Gt, self.Ainv, self.BetaInv)
-
-        # Laplace approximation of posterior covariance
+        # Laplace approximation of posterior precision
         self.A = (self.A + self.A.T)/2.
-        # self.Ainv = np.linalg.inv(self.A)
-        self.Ainv = (self.Ainv + self.Ainv.T)/2.
 
+    def update_covariance(self):
+        ### Approximate / fast method ###
+        self.Linv = self.compute_Linv(self.A)
+
+        ### Exact / slow method ###
+        # # update parameter covariance matrix given current parameter estimate
+        # self.Ainv = np.diag(1./self.Alpha)
+        #
+        # # loop over each sample in dataset
+        # for n_t, (treatment, t_eval, Y_batch) in self.dataset.items():
+        #
+        #     # faster to not evaluate in batches
+        #     for Y_measured in Y_batch:
+        #
+        #         # run model in batches
+        #         # for batch_inds in np.array_split(np.arange(n_samples), n_samples//self.batch_size):
+        #         # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
+        #
+        #         # for each output
+        #         output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:]))
+        #
+        #         # collect gradients and reshape
+        #         GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
+        #                          [len(t_eval)-1, self.n_sys_vars, self.n_r])
+        #
+        #         # collect gradients and reshape
+        #         GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
+        #                          [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
+        #
+        #         # stack gradient matrices
+        #         G = np.concatenate((GZ0, GZ), axis=-1)
+        #
+        #         # compress model gradient
+        #         G = np.einsum('ck,tki->tci', self.C, G)
+        #
+        #         # compute covariance
+        #         for Gt in G:
+        #             self.Ainv -= self.Ainv_next(Gt, self.Ainv, self.BetaInv)
+        #
+        # # Laplace approximation of posterior covariance
+        # self.Ainv = (self.Ainv + self.Ainv.T)/2.
+
+    # compute the log marginal likelihood
     def update_evidence(self):
-        # compute eigenvalues of precision
-        p_eigs = np.linalg.eigvalsh(self.A)
-
         # compute evidence
-        self.evidence = np.nansum(np.log(self.Alpha))/2. - \
-                        np.nansum(np.log(p_eigs[p_eigs>0]))/2. - \
-                        self.NLP + self.N*np.nansum(np.log(np.linalg.eigvalsh(self.Beta)))/2.
+        self.evidence = self.N/2*self.log_det(self.Beta)  + \
+                        1/2*np.nansum(np.log(self.Alpha)) - \
+                        1/2*self.log_det(self.A) - self.NLP
 
         # print evidence
         if self.verbose:
@@ -657,7 +703,7 @@ class ODE:
     def predict_point(self, x_test, teval):
 
         # make predictions given initial conditions and evaluation times
-        Y_predicted = np.nan_to_num(self.runODE(teval, x_test, self.params[:self.n_r], self.params[self.n_r:]))
+        Y_predicted = np.nan_to_num(self.runODE(teval, np.atleast_2d(x_test), self.params[:self.n_r], self.params[self.n_r:]))
 
         return Y_predicted
 
@@ -667,7 +713,7 @@ class ODE:
             self.update_covariance()
 
         # make predictions given initial conditions and evaluation times
-        output = np.nan_to_num(self.runODEZ(teval, x_test, self.params[:self.n_r], self.params[self.n_r:]))
+        output = np.nan_to_num(self.runODEZ(teval, np.atleast_2d(x_test), self.params[:self.n_r], self.params[self.n_r:]))
 
         # collect gradients and reshape
         GZ0 = np.reshape(output[:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
@@ -684,7 +730,9 @@ class ODE:
         Y_predicted = output[:, :self.n_sys_vars]
 
         # calculate covariance of each output (dimension = [steps, outputs])
-        covariance = 1./self.beta + self.GAinvG(G, self.Ainv)
+        BetaInv = np.zeros([self.n_sys_vars, self.n_sys_vars])
+        BetaInv[:self.n_s, :self.n_s] = self.BetaInv
+        covariance = BetaInv + self.GAinvG(G, self.Linv)
 
         # predicted stdv
         get_diag = vmap(jnp.diag, (0,))
@@ -698,7 +746,7 @@ class ODE:
             self.update_covariance()
 
         # make predictions given initial conditions and evaluation times
-        output = np.nan_to_num(self.runODEZ(teval, x_test, self.params[:self.n_r], self.params[self.n_r:]))
+        output = np.nan_to_num(self.runODEZ(teval, np.atleast_2d(x_test), self.params[:self.n_r], self.params[self.n_r:]))
 
         # collect gradients and reshape
         GZ0 = np.reshape(output[:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
@@ -718,7 +766,7 @@ class ODE:
         Y_predicted = output[:, :self.n_s]
 
         # calculate covariance of each output (dimension = [steps, outputs])
-        covariance = self.BetaInv + self.GAinvG(G, self.Ainv)
+        covariance = self.BetaInv + self.GAinvG(G, self.Linv)
 
         # predicted stdv
         get_diag = vmap(jnp.diag, (0,))
@@ -730,11 +778,10 @@ class ODE:
     def predict_MC(self, x_test, t_eval, n_samples=100):
 
         # monte carlo draws from posterior
-        L = np.linalg.cholesky(self.Ainv)
         z = np.random.randn(n_samples, self.n_params)
-        posterior_params = self.params + np.einsum('jk,ik->ij', L, z)
+        posterior_params = self.params + np.einsum('jk,ik->ij', self.Linv, z)
 
         # make point predictions of shape [n_mcmc, n_samples, n_time, n_outputs]
-        preds = vmap(lambda params: np.nan_to_num(self.runODE(t_eval, Y_measured[0], params[:self.n_r], params[self.n_r:])), (0,))(posterior_params)
+        preds = vmap(lambda params: np.nan_to_num(self.runODE(t_eval, np.atleast_2d(x_test), params[:self.n_r], params[self.n_r:])), (0,))(posterior_params)
 
         return preds
