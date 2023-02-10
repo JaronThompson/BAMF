@@ -222,6 +222,22 @@ class CRNN:
             return 2*jnp.sum(jnp.log(jnp.diag(L)))
         self.log_det = jit(log_det)
 
+        # log transform
+        def log_y(y):
+            return jnp.log(y+1e-8)*jnp.array(y>0, int)
+        self.log_y = jit(log_y)
+
+        def log_err(f, y):
+            return jnp.log((f+1e-8)/(y+1e-8))
+        self.log_err = jit(log_err)
+
+        # pad zeros
+        def pad_zeros(y):
+            y_copy = np.copy(y)
+            y_copy[y_copy==0] = 1.
+            return y_copy
+        self.pad_zeros = pad_zeros
+
         # compute inverse of L where A = LL^T
         def compute_Linv(A):
             return jnp.linalg.inv(jnp.linalg.cholesky(A))
@@ -374,11 +390,15 @@ class CRNN:
             Z = np.concatenate([Z_i.reshape(Z_i.shape[0], Z_i.shape[1], -1) for Z_i in Z], -1)
 
             # stack gradient matrices
-            G = np.concatenate((Y, Z), axis=-1)[1:, :self.n_s, :]
+            G = np.concatenate((Y, Z), axis=-1)
 
-            # Determine SSE
-            Y_error = output[1:, :self.n_s] - Y_measured[1:]
-            yCOV += self.yCOV_next(Y_error, G, Linv)
+            # gradient of log of species predictions
+            G[:, :self.n_s] = np.einsum('ij,ijk->ijk', 1./self.pad_zeros(output[:,:self.n_s]), G[:, :self.n_s])
+
+            # Determine SSE of log of Y
+            # Y_error = self.log_y(output[1:, :self.n_s]) - self.log_y(Y_measured[1:])
+            Y_error = self.log_err(output[1:, :self.n_s], Y_measured[1:])
+            yCOV += self.yCOV_next(Y_error, G[1:, :self.n_s, :], Linv)
 
         ### M step: update hyper-parameters ###
 
@@ -415,10 +435,8 @@ class CRNN:
             output = np.nan_to_num(self.runODE(t_eval, Y_measured, r0, params))
 
             # Determine error
-            Y_error = output[1:, :self.n_s] - Y_measured[1:]
-
-            # convert back to numpy
-            Y_error = Y_error
+            # Y_error = self.log_y(output[1:, :self.n_s]) - self.log_y(Y_measured[1:])
+            Y_error = self.log_err(output[1:, :self.n_s], Y_measured[1:])
 
             # Determine SSE and gradient of SSE
             self.NLP += np.einsum('tk,kl,tl->', Y_error, self.Beta, Y_error)/2.
@@ -450,13 +468,17 @@ class CRNN:
             Z = np.concatenate([Z_i.reshape(Z_i.shape[0], Z_i.shape[1], -1) for Z_i in Z], -1)
 
             # stack gradient matrices
-            G = np.concatenate((Y, Z), axis=-1)[1:, :self.n_s, :]
+            G = np.concatenate((Y, Z), axis=-1)
 
-            # Determine error
-            Y_error = output[1:,:self.n_s] - Y_measured[1:]
+            # gradient of log of species predictions
+            G[:, :self.n_s] = np.einsum('ij,ijk->ijk', 1./self.pad_zeros(output[:,:self.n_s]), G[:, :self.n_s])
+
+            # determine error
+            # Y_error = self.log_y(output[1:,:self.n_s]) - self.log_y(Y_measured[1:])
+            Y_error = self.log_err(output[1:, :self.n_s], Y_measured[1:])
 
             # sum over time and outputs to get gradient w.r.t params
-            grad_NLP += self.eval_grad_NLP(Y_error, self.Beta, G)
+            grad_NLP += self.eval_grad_NLP(Y_error, self.Beta, G[1:, :self.n_s, :])
 
         # return gradient of NLP
         return grad_NLP
@@ -485,10 +507,13 @@ class CRNN:
             Z = np.concatenate([Z_i.reshape(Z_i.shape[0], Z_i.shape[1], -1) for Z_i in Z], -1)
 
             # stack gradient matrices
-            G = np.concatenate((Y, Z), axis=-1)[1:, :self.n_s, :]
+            G = np.concatenate((Y, Z), axis=-1)
+
+            # gradient of log of species predictions
+            G[:, :self.n_s] = np.einsum('ij,ijk->ijk', 1./self.pad_zeros(output[:,:self.n_s]), G[:, :self.n_s])
 
             # compute Hessian
-            self.A += self.A_next(G, self.Beta)
+            self.A += self.A_next(G[1:, :self.n_s, :], self.Beta)
 
         # make sure precision is symmetric
         self.A = (self.A + self.A.T)/2.
@@ -514,10 +539,10 @@ class CRNN:
             Z = np.concatenate([Z_i.reshape(Z_i.shape[0], Z_i.shape[1], -1) for Z_i in Z], -1)
 
             # stack gradient matrices
-            G = np.concatenate((Y, Z), axis=-1)[1:, :self.n_s, :]
+            G = np.einsum("ijk,ij->ijk", np.concatenate((Y, Z), axis=-1), 1./self.pad_zeros(output))
 
             # compute Hessian
-            self.A += self.A_next(G, self.Beta)
+            self.A += self.A_next(G[1:, :self.n_s, :], self.Beta)
 
         # Laplace approximation of posterior precision
         self.A = (self.A + self.A.T)/2.
@@ -554,11 +579,11 @@ class CRNN:
         return output
 
     # Define function to make predictions on test data
-    def predict(self, x_test, t_eval):
+    def predict(self, x_test, t_eval, n_std=1.):
 
         # integrate forward sensitivity equations
         xYZ = self.runODEZ(t_eval, np.atleast_2d(x_test), self.r0, self.params)
-        Y_predicted = np.nan_to_num(xYZ[0])
+        output = np.nan_to_num(np.array(xYZ[0]))
         Y = xYZ[1]
         Z = xYZ[2:]
 
@@ -568,15 +593,20 @@ class CRNN:
         # stack gradient matrices
         G = np.concatenate((Y, Z), axis=-1)
 
+        # gradient of log of species predictions
+        G[:, :self.n_s] = np.einsum('ij,ijk->ijk', 1./self.pad_zeros(output[:,:self.n_s]), G[:, :self.n_s])
 
         # calculate covariance of each output (dimension = [steps, outputs])
         BetaInv = np.zeros([self.n_x, self.n_x])
         BetaInv[:self.n_s, :self.n_s] = self.BetaInv
         covariance = BetaInv + self.GAinvG(G, self.Linv)
 
-        # predicted stdv
+        # predicted stdv of log y
         get_diag = vmap(jnp.diag, (0,))
         stdv = np.sqrt(get_diag(covariance))
 
+        # determine confidence interval for species
+        L = np.exp(self.log_y(output[:, :self.n_s]) - n_std*stdv[:, :self.n_s])*np.array(output[:, :self.n_s] > 0, int)
+        U = np.exp(self.log_y(output[:, :self.n_s]) + n_std*stdv[:, :self.n_s])*np.array(output[:, :self.n_s] > 0, int)
 
-        return np.array(Y_predicted), np.array(stdv), np.array(covariance)
+        return output, L, U
