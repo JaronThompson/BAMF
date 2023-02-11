@@ -224,7 +224,7 @@ class CRNN:
 
         # log transform
         def log_y(y):
-            return jnp.log(y+1e-8)*jnp.array(y>0, int)
+            return jnp.log(y+1e-8)
         self.log_y = jit(log_y)
 
         def log_err(f, y):
