@@ -52,47 +52,27 @@ def runODEA(t_eval, zt, at, CRparams, dXA_dt):
     lt = np.zeros(n_params)
 
     # concatenate final condition
-    xal = jnp.concatenate((zt, at, lt))
+    xal = (zt, at, lt)
 
     # solve ODE model
     y = odeint(dXA_dt, xal, t_eval, CRparams)
 
-    return y[-1]
-
-# function to compute gradient of state w.r.t. parameters
-def dZdt(system, Z, t, x, params):
-
-    # compute Jacobian (gradient of model w.r.t. x)
-    Jx = jacfwd(system, 1)(t, x, params)
-
-    # compute gradient of model w.r.t. parameters
-    Jp = jacfwd(system, 2)(t, x, params)
-
-    return Jx@Z + Jp
-
-# function to compute gradient of state w.r.t initial condition
-def dZ0dt(system, Z0, t, x, params):
-
-    # compute Jacobian (gradient of model w.r.t. x)
-    Jx = jacfwd(system, 1)(t, x, params)
-
-    return Jx@Z0
+    return jnp.concatenate([y[1][-1], y[2][-1]])
 
 # define function that returns model sensitivity vector
 def runODEZ(t_eval, s0, r0, CRparams, dXZ_dt):
     # check dimensions
     dim_x = len(s0) + len(r0)
     n_params = len(CRparams)
-    dim_z = dim_x*n_params
 
     # set initial condition of z0 equal to I
-    z0 = np.eye(dim_x)[:,len(s0):].flatten()
-    xz = jnp.concatenate((s0, r0, z0, np.zeros(dim_z)))
+    z0 = np.eye(dim_x)[:,len(s0):]
+    xz = (jnp.concatenate([s0, r0]), z0, np.zeros([dim_x, n_params]))
 
     # solve ODE model
-    y = odeint(dXZ_dt, xz, t_eval, CRparams)
+    y, Z0, Z = odeint(dXZ_dt, xz, t_eval, CRparams)
 
-    return y
+    return y, Z0, Z
 
 ### Function to process dataframes ###
 def process_df(df, species):
@@ -179,43 +159,46 @@ class ODE:
         # jit compile differential equation
         def dX_dt(x, t, params):
             # concatentate x and z
-            return system(t, x, params)
+            return system(x, t, params)
         self.dX_dt = jit(dX_dt)
 
         # adjoint sensitivity derivative
         def dXA_dt(xa, t, params):
-            # split up x, a, and l
-            x = xa[:self.n_sys_vars]
-            a = xa[self.n_sys_vars:2*self.n_sys_vars]
 
-            # compute derivatives
-            dxdt = -system(t, x, params)
-            # vector jacobian product...
-            dadt = a@jacfwd(system, 1)(t, x, params)
-            dldt = a@jacfwd(system, 2)(t, x, params)
+            # unpack state, adjoint, and gradient of loss w.r.t. parameters
+            x, a, _ = xa
+            # vjp returns system evaluated at x,t,params and
+            # vjpfun, which evaluates a^T Jx, a^T Jp
+            # where Jx is the gradient of the system w.r.t. x
+            # and   Jp is the gradient of the system w.r.t. parameters
+            y_dot, vjpfun = jax.vjp(lambda x, params: system(x,t,params), x, params)
+            vjps = vjpfun(a)
 
-            # return derivatives of augmented system
-            dxadt = jnp.concatenate([dxdt, dadt, dldt])
-            return dxadt
-        self.dXA_dt = jit(dXA_dt)
+            return (-y_dot, *vjps)
+        self.dXA_dt = dXA_dt
 
         # if not vectorized, xz will be 1-D
-        dim_z0 = self.n_sys_vars*self.n_r
-        dim_z = self.n_sys_vars*len(CRparams)
-        def dXZ_dt(xz, t, params):
+        def dXZ_dt(xZ, t, params):
             # split up x, z, and z0
-            x = xz[:self.n_sys_vars]
-            Z0 = jnp.reshape(xz[self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r], [self.n_sys_vars, self.n_r])
-            Z = jnp.reshape(xz[self.n_sys_vars+self.n_sys_vars*self.n_r:], [self.n_sys_vars, len(params)])
+            x, Z0, Z = xZ
 
             # compute derivatives
-            dxdt  = system(t, x, params)
-            dz0dt = jnp.reshape(dZ0dt(system, Z0, t, x, params), dim_z0)
-            dzdt  = jnp.reshape(dZdt(system, Z, t, x, params), dim_z)
+            dxdt  = system(x, t, params)
 
-            # concatentate x and z
-            dXZdt = jnp.concatenate([dxdt, dz0dt, dzdt])
-            return dXZdt
+            # time derivative of initial condition sensitivity
+            # Jacobian-vector-product approach is surprisingly slow 
+            # JxV  = vmap(lambda z: jax.jvp(lambda x: system(x,t,params), (x,), (z,))[1], (1), (1))
+            Jx = jacfwd(system, 0)(x, t, params)
+            JxZ0 = Jx@Z0 # JxV(Z0)
+
+            # time derivative of parameter sensitivity
+            JxZ = Jx@Z # JxV(Z)
+
+            # compute gradient of model w.r.t. parameters
+            Jp = jacfwd(system, 2)(x, t, params)
+
+            # return derivatives
+            return (dxdt, JxZ0, JxZ + Jp)
         self.dXZ_dt = jit(dXZ_dt)
 
         # jit compile function to integrate ODE
@@ -229,7 +212,7 @@ class ODE:
         # jit compile function to integrate adjoint sensitivity equations
         self.adjoint = jit(vmap(jacfwd(lambda zt, yt, B: jnp.einsum("i,ij,j", yt-self.C@zt, B, yt-self.C@zt)/2.), (0, 0, None)))
         self.runODEA = jit(lambda t_eval, xt, at, CRparams: runODEA(t_eval, xt, at, CRparams, self.dXA_dt))
-        self.batchODEA = jit(vmap(lambda t, out, a, p: self.runODEA(jnp.array([0., t]), out, a, p)[self.n_sys_vars+self.n_s:], (0, 0, 0, None)))
+        self.batchODEA = jit(vmap(lambda t, out, a, p: self.runODEA(jnp.array([0., t]), out, a, p)[self.n_s:], (0, 0, 0, None)))
 
         def GAinvG(G, Linv):
             return jnp.einsum("tij,kj,kl,tml->tim", G, Linv, Linv, G)
@@ -266,6 +249,22 @@ class ODE:
             L = jnp.linalg.cholesky(A)
             return 2*jnp.sum(jnp.log(jnp.diag(L)))
         self.log_det = jit(log_det)
+
+        # log transform
+        def log_y(y):
+            return jnp.log(y+1e-3)
+        self.log_y = jit(log_y)
+
+        def log_err(f, y):
+            return jnp.log((f+1e-3)/(y+1e-3))
+        self.log_err = jit(log_err)
+
+        # pad zeros
+        def pad_zeros(y):
+            y_copy = np.copy(y)
+            y_copy[y_copy==0] = 1.
+            return y_copy
+        self.pad_zeros = pad_zeros
 
         # compute inverse of L where A = LL^T
         def compute_Linv(A):
@@ -326,8 +325,8 @@ class ODE:
                                 tol=nlp_tol,
                                 method='Newton-CG',
                                 callback=self.callback)
-            if self.verbose:
-                print(self.res)
+            # if self.verbose:
+            #     print(self.res)
             self.params = self.res.x
 
             # update covariance
@@ -373,6 +372,7 @@ class ODE:
 
         # finally compute covariance (Hessian inverse)
         self.update_covariance()
+        self.final_hypers()
 
     def init_hypers(self):
 
@@ -430,28 +430,14 @@ class ODE:
             # run model using current parameters, output = [n_time, self.n_sys_vars]
             # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
 
-            # for each output in the batch
-            output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:]))
-
-            # keep only observed predictions
-            Y_predicted = np.einsum('ck,tk->tc', self.C, output[1:, :self.n_sys_vars])
-
-            # collect gradients and reshape
-            GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
-                             [len(t_eval)-1, self.n_sys_vars, self.n_r])
-
-            # collect gradients and reshape
-            GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
-                             [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
+            # for each output
+            output, Z0, Z = self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:])
 
             # stack gradient matrices
-            G = np.concatenate((GZ0, GZ), axis=-1)
-
-            # compress model gradient
-            G = np.einsum('ck,tki->tci', self.C, G)
+            G = np.concatenate((Z0, Z), axis=-1)[1:, :self.n_s]
 
             # Determine SSE
-            Y_error = Y_predicted - Y_measured[1:]
+            Y_error = output[1:, :self.n_s] - Y_measured[1:]
             yCOV += self.yCOV_next(Y_error, G, Linv)
 
         ### M step: update hyper-parameters ###
@@ -459,8 +445,8 @@ class ODE:
         # maximize complete data log-likelihood w.r.t. alpha and beta
         Ainv_ii = self.Ainv_diag(Linv)
         self.alpha = self.n_params/(np.sum((self.params-self.prior)**2) + np.sum(Ainv_ii) + 2.*self.a)
-        self.Alpha = self.alpha*np.ones(self.n_params)
-        # self.Alpha = 1./((self.params-self.prior)**2 + Ainv_ii + 2.*self.a)
+        # self.Alpha = self.alpha*np.ones(self.n_params)
+        self.Alpha = 1./((self.params-self.prior)**2 + Ainv_ii + 2.*self.a)
 
         # update output precision
         self.Beta = self.N*np.linalg.inv(yCOV + 2.*self.b*np.eye(self.C.shape[0]))
@@ -469,6 +455,28 @@ class ODE:
 
         if self.verbose:
             print("Total samples: {:.0f}, Updated regularization: {:.2e}".format(self.N, self.alpha))
+
+    # determine precision of log of y
+    def final_hypers(self):
+
+        # init yCOV
+        yCOV = 0.
+
+        # loop over each sample in dataset
+        for treatment, t_eval, Y_measured in self.dataset:
+
+            # run model using current parameters, output = [n_time, self.n_sys_vars]
+            # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
+
+            # for each output
+            output = self.runODE(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:])
+
+            # Determine SSE
+            Y_error = self.log_err(output[1:, :self.n_s], Y_measured[1:])
+            yCOV += np.einsum('tk,tl->kl', Y_error, Y_error)
+
+        # update output precision
+        self.LogBetaInv = yCOV / self.N
 
     def objective(self, params):
         # compute negative log posterior (NLP)
@@ -486,11 +494,8 @@ class ODE:
             # for each output
             output = np.nan_to_num(self.runODE(t_eval, Y_measured, params[:self.n_r], params[self.n_r:]))
 
-            # only observe species
-            Y_predicted = np.einsum('ck,tk->tc', self.C, output[1:, :self.n_sys_vars])
-
             # Determine error
-            Y_error = Y_predicted - Y_measured[1:]
+            Y_error = output[1:, :self.n_s] - Y_measured[1:]
 
             # Determine SSE and gradient of SSE
             self.NLP += np.einsum('tk,kl,tl->', Y_error, self.Beta, Y_error)/2.
@@ -512,36 +517,33 @@ class ODE:
             # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
 
             ### Adjoint sensitivity method also seems to be slower?
-            # output = np.nan_to_num(self.runODE(t_eval, Y_measured[0], params[:self.n_r], params[self.n_r:]))
-            #
-            # # adjoint at measured time points
-            # at = self.adjoint(output, Y_measured, self.Beta)
-            #
-            # # gradient of NLP
-            # grad_NLP += np.sum(self.batchODEA(t_eval[1:], output[1:], at[1:], params[self.n_r:]), 0)
+            output = np.nan_to_num(self.runODE(t_eval, Y_measured, params[:self.n_r], params[self.n_r:]))
+
+            # adjoint at measured time points
+            at = self.adjoint(output, Y_measured, self.Beta)
+
+            # gradient of NLP
+            grad_NLP += np.sum(self.batchODEA(t_eval[1:], output[1:], at[1:], params[self.n_r:]), 0)
+
+        # return gradient of NLP
+        return grad_NLP
+
+    def jacobian_fwd(self, params):
+
+        # compute gradient of negative log posterior
+        grad_NLP = self.Alpha*(params-self.prior)
+
+        # loop over each sample in dataset
+        for treatment, t_eval, Y_measured in self.dataset:
 
             # for each output
-            output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, params[:self.n_r], params[self.n_r:]))
-
-            # only observe species
-            Y_predicted = np.einsum('ck,tk->tc', self.C, output[1:, :self.n_sys_vars])
-
-            # collect gradients and reshape
-            GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
-                             [len(t_eval)-1, self.n_sys_vars, self.n_r])
-
-            # collect gradients and reshape
-            GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
-                             [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
+            output, Z0, Z = self.runODEZ(t_eval, Y_measured, params[:self.n_r], params[self.n_r:])
 
             # stack gradient matrices
-            G = np.concatenate((GZ0, GZ), axis=-1)
-
-            # compress model gradient
-            G = np.einsum('ck,tki->tci', self.C, G)
+            G = np.concatenate((Z0, Z), axis=-1)[1:, :self.n_s]
 
             # Determine error
-            Y_error = Y_predicted - Y_measured[1:]
+            Y_error = output[1:, :self.n_s] - Y_measured[1:]
 
             # sum over time and outputs to get gradient w.r.t params
             grad_NLP += self.eval_grad_NLP(Y_error, self.Beta, G)
@@ -562,21 +564,10 @@ class ODE:
             # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], params[:self.n_r], params[self.n_r:]))
 
             # for each output
-            output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, params[:self.n_r], params[self.n_r:]))
-
-            # collect gradients and reshape
-            GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
-                             [len(t_eval)-1, self.n_sys_vars, self.n_r])
-
-            # collect gradients and reshape
-            GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
-                             [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
+            output, Z0, Z = self.runODEZ(t_eval, Y_measured, params[:self.n_r], params[self.n_r:])
 
             # stack gradient matrices
-            G = np.concatenate((GZ0, GZ), axis=-1)
-
-            # compress model gradient
-            G = np.einsum('ck,tki->tci', self.C, G)
+            G = np.concatenate((Z0, Z), axis=-1)[1:, :self.n_s]
 
             # compute Hessian
             self.A += self.A_next(G, self.Beta)
@@ -599,21 +590,10 @@ class ODE:
             # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
 
             # for each output
-            output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:]))
-
-            # collect gradients and reshape
-            GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
-                             [len(t_eval)-1, self.n_sys_vars, self.n_r])
-
-            # collect gradients and reshape
-            GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
-                             [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
+            output, Z0, Z = self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:])
 
             # stack gradient matrices
-            G = np.concatenate((GZ0, GZ), axis=-1)
-
-            # compress model gradient
-            G = np.einsum('ck,tki->tci', self.C, G)
+            G = np.concatenate((Z0, Z), axis=-1)[1:, :self.n_s]
 
             # compute Hessian
             self.A += self.A_next(G, self.Beta)
@@ -637,21 +617,10 @@ class ODE:
         #     # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
         #
         #     # for each output
-        #     output = np.nan_to_num(self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:]))
-        #
-        #     # collect gradients and reshape
-        #     GZ0 = np.reshape(output[1:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
-        #                      [len(t_eval)-1, self.n_sys_vars, self.n_r])
-        #
-        #     # collect gradients and reshape
-        #     GZ  = np.reshape(output[1:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
-        #                      [len(t_eval)-1, self.n_sys_vars, self.n_params-self.n_r])
+        #     output, Z0, Z = self.runODEZ(t_eval, Y_measured, params[:self.n_r], params[self.n_r:])
         #
         #     # stack gradient matrices
-        #     G = np.concatenate((GZ0, GZ), axis=-1)
-        #
-        #     # compress model gradient
-        #     G = np.einsum('ck,tki->tci', self.C, G)
+        #     G = np.concatenate((Z0, Z), axis=-1)[1:, :self.n_s]
         #
         #     # compute covariance
         #     for Gt in G:
@@ -683,72 +652,30 @@ class ODE:
 
         return Y_predicted
 
-    def predict_latent(self, x_test, teval):
+    def predict(self, x_test, t_eval, n_std=1.):
         # check if precision has been computed
-        if self.A is None:
-            self.update_covariance()
 
-        # make predictions given initial conditions and evaluation times
-        output = np.nan_to_num(self.runODEZ(teval, np.atleast_2d(x_test), self.params[:self.n_r], self.params[self.n_r:]))
-
-        # collect gradients and reshape
-        GZ0 = np.reshape(output[:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
-                         [len(teval), self.n_sys_vars, self.n_r])
-
-        # collect gradients and reshape
-        GZ  = np.reshape(output[:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
-                         [len(teval), self.n_sys_vars, self.n_params-self.n_r])
+        # for each output
+        output, Z0, Z = self.runODEZ(t_eval, np.atleast_2d(x_test), self.params[:self.n_r], self.params[self.n_r:])
 
         # stack gradient matrices
-        G = np.concatenate((GZ0, GZ), axis=-1)
+        G = np.concatenate((Z0, Z), axis=-1)[:, :self.n_s]
 
-        # compress model outputs
-        Y_predicted = output[:, :self.n_sys_vars]
+        # gradient of log of species predictions
+        G = np.einsum('ij,ijk->ijk', 1./self.pad_zeros(output[:,:self.n_s]), G)
 
         # calculate covariance of each output (dimension = [steps, outputs])
-        BetaInv = np.zeros([self.n_sys_vars, self.n_sys_vars])
-        BetaInv[:self.n_s, :self.n_s] = self.BetaInv
-        covariance = BetaInv + self.GAinvG(G, self.Linv)
+        covariance = self.LogBetaInv + self.GAinvG(G, self.Linv)
 
-        # predicted stdv
+        # predicted stdv of log y
         get_diag = vmap(jnp.diag, (0,))
         stdv = np.sqrt(get_diag(covariance))
 
-        return Y_predicted, stdv, covariance
+        # determine confidence interval for species
+        L = np.exp(self.log_y(output[:, :self.n_s]) - n_std*stdv)*np.array(output[:, :self.n_s] > 0, int)
+        U = np.exp(self.log_y(output[:, :self.n_s]) + n_std*stdv)*np.array(output[:, :self.n_s] > 0, int)
 
-    def predict(self, x_test, teval):
-        # check if precision has been computed
-        if self.A is None:
-            self.update_covariance()
-
-        # make predictions given initial conditions and evaluation times
-        output = np.nan_to_num(self.runODEZ(teval, np.atleast_2d(x_test), self.params[:self.n_r], self.params[self.n_r:]))
-
-        # collect gradients and reshape
-        GZ0 = np.reshape(output[:, self.n_sys_vars:self.n_sys_vars+self.n_sys_vars*self.n_r],
-                         [len(teval), self.n_sys_vars, self.n_r])
-
-        # collect gradients and reshape
-        GZ  = np.reshape(output[:, self.n_sys_vars+self.n_sys_vars*self.n_r:],
-                         [len(teval), self.n_sys_vars, self.n_params-self.n_r])
-
-        # stack gradient matrices
-        G = np.concatenate((GZ0, GZ), axis=-1)
-
-        # compress model gradient
-        G = np.einsum('ck,tki->tci', self.C, G)
-
-        # compress model outputs
-        Y_predicted = output[:, :self.n_s]
-
-        # calculate covariance of each output (dimension = [steps, outputs])
-        covariance = self.BetaInv + self.GAinvG(G, self.Linv)
-
-        # predicted stdv
-        get_diag = vmap(jnp.diag, (0,))
-        stdv = np.sqrt(get_diag(covariance))
-
-        return Y_predicted, stdv, covariance
+        return output, L, U
 
     # function to predict from posterior samples
     def predict_MC(self, x_test, t_eval, n_samples=100):
@@ -758,6 +685,6 @@ class ODE:
         posterior_params = self.params + np.einsum('jk,ik->ij', self.Linv, z)
 
         # make point predictions of shape [n_mcmc, n_samples, n_time, n_outputs]
-        preds = vmap(lambda params: np.nan_to_num(self.runODE(t_eval, np.atleast_2d(x_test), params[:self.n_r], params[self.n_r:])), (0,))(posterior_params)
+        preds = vmap(lambda params: jnp.nan_to_num(self.runODE(t_eval, jnp.atleast_2d(x_test), self.params[:self.n_r], params[self.n_r:])), (0,))(posterior_params)
 
         return preds

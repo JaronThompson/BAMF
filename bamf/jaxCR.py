@@ -15,21 +15,6 @@ from jax.nn import tanh, sigmoid
 import jax.numpy as jnp
 from jax.experimental.ode import odeint
 
-### Basic usage ###
-
-'''
-# import ODE
-from autode.autode import ODE
-
-# instantiate ODE fit
-model = ODE(system, df, params)
-
-# fit to data
-params = model.fit()
-
-where df has columns [Time, Treatments, S1, ..., SN]
-'''
-
 ### Function to process dataframes ###
 def process_df(df, species):
 
@@ -65,7 +50,7 @@ class CRNN:
         # death rate
         d = -3.*np.ones(self.n_s)
         # [C]_ij = rate that species j consumes resource i
-        C = np.random.uniform(-1., 0., [self.n_r, self.n_s])
+        C = np.random.uniform(-1.,  0., [self.n_r, self.n_s])
         # [P]_ij = rate that species j produces resource i
         P = np.random.uniform(-5., -1., [self.n_r, self.n_s])
         # carrying capacity of resource
@@ -82,7 +67,7 @@ class CRNN:
         b2 = np.random.randn(self.n_r+2*self.n_s)
 
         # initial resource concentration (log)
-        self.r0 = np.random.uniform(-2, 0, self.n_r)
+        self.r0 = np.random.uniform(-2., 0., self.n_r)
 
         # concatenate parameter initial guess
         self.params = (d, C, P, k, W1, b1, W2, b2)
@@ -224,11 +209,11 @@ class CRNN:
 
         # log transform
         def log_y(y):
-            return jnp.log(y+1e-8)
+            return jnp.log(y+1e-3)
         self.log_y = jit(log_y)
 
         def log_err(f, y):
-            return jnp.log((f+1e-8)/(y+1e-8))
+            return jnp.log((f+1e-3)/(y+1e-3))
         self.log_err = jit(log_err)
 
         # pad zeros
@@ -256,7 +241,7 @@ class CRNN:
     def reshape(self, params):
         return [np.array(np.reshape(params[k1:k2], shape), dtype=np.float32) for k1,k2,shape in zip(self.k_params, self.k_params[1:], self.shapes)]
 
-    def fit(self, evidence_tol=1e-3, nlp_tol=None, alpha_0=1e-5, patience=2, max_fails=2, beta=1e-3):
+    def fit(self, evidence_tol=1e-3, nlp_tol=None, alpha_0=1e-5, patience=1, max_fails=2, beta=1e-3):
         # estimate parameters using gradient descent
         self.alpha_0 = alpha_0
         self.itr = 0
@@ -284,8 +269,8 @@ class CRNN:
                                 tol=nlp_tol,
                                 method='Newton-CG',
                                 callback=self.callback)
-            if self.verbose:
-                print(self.res)
+            # if self.verbose:
+            #     print(self.res)
             params = self.res.x
             self.r0 = np.array(params[:self.n_r], dtype=np.float32)
             self.params = self.reshape(params[self.n_r:])
@@ -383,6 +368,7 @@ class CRNN:
             # integrate forward sensitivity equations
             xYZ = self.runODEZ(t_eval, Y_measured, self.r0, self.params)
             output = np.nan_to_num(xYZ[0])
+            output = np.clip(output, 0., np.inf)
             Y = xYZ[1]
             Z = xYZ[2:]
 
@@ -433,6 +419,7 @@ class CRNN:
 
             # for each output
             output = np.nan_to_num(self.runODE(t_eval, Y_measured, r0, params))
+            output = np.clip(output, 0., np.inf)
 
             # Determine error
             # Y_error = self.log_y(output[1:, :self.n_s]) - self.log_y(Y_measured[1:])
@@ -461,6 +448,7 @@ class CRNN:
             # integrate forward sensitivity equations
             xYZ = self.runODEZ(t_eval, Y_measured, r0, params)
             output = np.nan_to_num(xYZ[0])
+            output = np.clip(output, 0., np.inf)
             Y = xYZ[1]
             Z = xYZ[2:]
 
@@ -468,17 +456,66 @@ class CRNN:
             Z = np.concatenate([Z_i.reshape(Z_i.shape[0], Z_i.shape[1], -1) for Z_i in Z], -1)
 
             # stack gradient matrices
-            G = np.concatenate((Y, Z), axis=-1)
+            G = np.nan_to_num(np.concatenate((Y, Z), axis=-1))
 
             # gradient of log of species predictions
             G[:, :self.n_s] = np.einsum('ij,ijk->ijk', 1./self.pad_zeros(output[:,:self.n_s]), G[:, :self.n_s])
 
             # determine error
-            # Y_error = self.log_y(output[1:,:self.n_s]) - self.log_y(Y_measured[1:])
             Y_error = self.log_err(output[1:, :self.n_s], Y_measured[1:])
 
             # sum over time and outputs to get gradient w.r.t params
             grad_NLP += self.eval_grad_NLP(Y_error, self.Beta, G[1:, :self.n_s, :])
+
+            # # compare to finite differences
+            # # d NLP(theta) d_theta_i = [NLP(theta_i + eps) - NLP(theta_i)] / eps
+            # grad_NLP = self.eval_grad_NLP(Y_error, self.Beta, G[1:, :self.n_s, :])
+            # eps = 1e-3
+            # fd_grad_r0 = np.zeros(self.n_r)
+            # for i in range(self.n_r):
+            #     # error plus eps
+            #     fd_r0 = np.copy(r0)
+            #     fd_r0[i] += eps
+            #     fd_out = self.runODE(t_eval, Y_measured, fd_r0, params)
+            #     fd_err = self.log_err(fd_out[1:,:self.n_s], Y_measured[1:])
+            #     fd_nll = np.einsum("ti,ij,tj->", fd_err, self.Beta, fd_err)/2.
+            #
+            #     # error
+            #     out = self.runODE(t_eval, Y_measured, r0, params)
+            #     err = self.log_err(out[1:,:self.n_s], Y_measured[1:])
+            #     nll = np.einsum("ti,ij,tj->", err, self.Beta, err)/2.
+            #
+            #     # approximate gradient
+            #     fd_grad_r0[i] = (fd_nll - nll)/eps
+            #
+            # # plot
+            # plt.scatter(fd_grad_r0, grad_NLP[:self.n_r])
+            # plt.show()
+            #
+            # eps = 1e-3
+            # fd_grad_params = np.zeros_like(grad_NLP[self.n_r:])
+            # # tricky because params are weirdly shaped
+            # for i, _ in enumerate(fd_grad_params):
+            #
+            #     # error plus eps
+            #     fd_params = np.concatenate([np.copy(p).ravel() for p in params])
+            #     fd_params[i] += eps
+            #     fd_params = self.reshape(fd_params)
+            #     fd_out = self.runODE(t_eval, Y_measured, r0, fd_params)
+            #     fd_err = self.log_err(fd_out[1:,:self.n_s], Y_measured[1:])
+            #     fd_nll = np.einsum("ti,ij,tj->", fd_err, self.Beta, fd_err)/2.
+            #
+            #     # error
+            #     out = self.runODE(t_eval, Y_measured, r0, params)
+            #     err = self.log_err(out[1:,:self.n_s], Y_measured[1:])
+            #     nll = np.einsum("ti,ij,tj->", err, self.Beta, err)/2.
+            #
+            #     # approximate gradient
+            #     fd_grad_params[i] = (fd_nll - nll)/eps
+            #
+            # # plot
+            # plt.scatter(fd_grad_params, grad_NLP[self.n_r:])
+            # plt.show()
 
         # return gradient of NLP
         return grad_NLP
@@ -498,8 +535,8 @@ class CRNN:
 
             # integrate forward sensitivity equations
             xYZ = self.runODEZ(t_eval, Y_measured, r0, params)
-
             output = np.nan_to_num(xYZ[0])
+            output = np.clip(output, 0., np.inf)
             Y = xYZ[1]
             Z = xYZ[2:]
 
@@ -507,7 +544,7 @@ class CRNN:
             Z = np.concatenate([Z_i.reshape(Z_i.shape[0], Z_i.shape[1], -1) for Z_i in Z], -1)
 
             # stack gradient matrices
-            G = np.concatenate((Y, Z), axis=-1)
+            G = np.nan_to_num(np.concatenate((Y, Z), axis=-1))
 
             # gradient of log of species predictions
             G[:, :self.n_s] = np.einsum('ij,ijk->ijk', 1./self.pad_zeros(output[:,:self.n_s]), G[:, :self.n_s])
@@ -532,6 +569,8 @@ class CRNN:
             # integrate forward sensitivity equations
             xYZ = self.runODEZ(t_eval, Y_measured, self.r0, self.params)
             output = np.nan_to_num(xYZ[0])
+            output = np.clip(output, 0., np.inf)
+
             Y = xYZ[1]
             Z = xYZ[2:]
 
@@ -539,7 +578,10 @@ class CRNN:
             Z = np.concatenate([Z_i.reshape(Z_i.shape[0], Z_i.shape[1], -1) for Z_i in Z], -1)
 
             # stack gradient matrices
-            G = np.einsum("ijk,ij->ijk", np.concatenate((Y, Z), axis=-1), 1./self.pad_zeros(output))
+            G = np.concatenate((Y, Z), axis=-1)
+
+            # gradient of log of species predictions
+            G[:, :self.n_s] = np.einsum('ij,ijk->ijk', 1./self.pad_zeros(output[:,:self.n_s]), G[:, :self.n_s])
 
             # compute Hessian
             self.A += self.A_next(G[1:, :self.n_s, :], self.Beta)
@@ -584,6 +626,7 @@ class CRNN:
         # integrate forward sensitivity equations
         xYZ = self.runODEZ(t_eval, np.atleast_2d(x_test), self.r0, self.params)
         output = np.nan_to_num(np.array(xYZ[0]))
+        output = np.clip(output, 0., np.inf)
         Y = xYZ[1]
         Z = xYZ[2:]
 
