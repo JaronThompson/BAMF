@@ -35,42 +35,42 @@ where df has columns [Time, Treatments, S1, ..., SN]
 '''
 
 # define function that returns model sensitivity vector
-def runODE(t_eval, s0, r0, CRparams, dX_dt):
+def runODE(t_eval, s0, r0, cr_params, dX_dt):
     # solve ODE model
     x0 = jnp.concatenate((s0, r0))
-    y = odeint(dX_dt, x0, t_eval, CRparams)
+    y = odeint(dX_dt, x0, t_eval, cr_params)
     # jac = jit(jacfwd(dX_dt, 1))
     # soln = solve_ivp(dX_dt, t_span=(t_eval[0], t_eval[-1]), y0=x0,
-    #                  args=(CRparams,), t_eval=t_eval, method='LSODA', jac=jac)
+    #                  args=(cr_params,), t_eval=t_eval, method='LSODA', jac=jac)
 
     return y
 
 # define function to integrate adjoint sensitivity equations backwards
-def runODEA(t_eval, zt, at, CRparams, dXA_dt):
+def runODEA(t_eval, zt, at, cr_params, dXA_dt):
     # check dimensions
-    n_params = len(CRparams)
+    n_params = len(cr_params)
     lt = np.zeros(n_params)
 
     # concatenate final condition
     xal = (zt, at, lt)
 
     # solve ODE model
-    y = odeint(dXA_dt, xal, t_eval, CRparams)
+    y = odeint(dXA_dt, xal, t_eval, cr_params)
 
     return jnp.concatenate([y[1][-1], y[2][-1]])
 
 # define function that returns model sensitivity vector
-def runODEZ(t_eval, s0, r0, CRparams, dXZ_dt):
+def runODEZ(t_eval, s0, r0, cr_params, dXZ_dt):
     # check dimensions
     dim_x = len(s0) + len(r0)
-    n_params = len(CRparams)
+    n_params = len(cr_params)
 
     # set initial condition of z0 equal to I
     z0 = np.eye(dim_x)[:,len(s0):]
     xz = (jnp.concatenate([s0, r0]), z0, np.zeros([dim_x, n_params]))
 
     # solve ODE model
-    y, Z0, Z = odeint(dXZ_dt, xz, t_eval, CRparams)
+    y, Z0, Z = odeint(dXZ_dt, xz, t_eval, cr_params)
 
     return y, Z0, Z
 
@@ -82,7 +82,7 @@ def process_df(df, species):
     for treatment, comm_data in df.groupby("Treatments"):
 
         # make sure comm_data is sorted in chronological order
-        comm_data.sort_values(by='Time', ascending=True, inplace=True)
+        comm_data = comm_data.sort_values(by='Time', ascending=True).copy()
 
         # pull evaluation times
         t_eval = np.array(comm_data['Time'].values, float)
@@ -96,8 +96,8 @@ def process_df(df, species):
     return data
 
 class ODE:
-    def __init__(self, system, dataframe, C, CRparams, r0, species,
-                 alpha_0=1e-5, f_ind=1., batch_size=None, prior=None, verbose=True):
+    def __init__(self, system, dataframe, cr_params, r0, species,
+                 alpha_0=1e-5, log_tol=1e-5, batch_size=None, prior=None, verbose=True):
         '''
         system: a system of differential equations
 
@@ -116,14 +116,11 @@ class ODE:
         '''
 
         # make sure params are 1-dimensional
-        self.params = np.concatenate((r0, np.array(CRparams).ravel()))
+        self.params = np.concatenate((r0, np.array(cr_params).ravel()))
         self.prior  = np.concatenate((-5.*np.ones_like(r0), np.array(prior).ravel()))
 
         # initial degree of regularization
         self.alpha_0 = alpha_0
-
-        # fraction of independent samples (N_eff = f_ind*N)
-        self.f_ind = f_ind
 
         # batch_size
         self.batch_size = batch_size
@@ -136,11 +133,6 @@ class ODE:
         # dimension of model output
         self.species = species
         self.n_sys_vars = self.n_s + self.n_r
-
-        # observability functions
-        self.C = C
-        self.CCT = C@C.T
-        self.CCTinv = np.linalg.inv(self.CCT)
 
         # set up data
         self.dataset = process_df(dataframe, species)
@@ -175,7 +167,7 @@ class ODE:
             vjps = vjpfun(a)
 
             return (-y_dot, *vjps)
-        self.dXA_dt = dXA_dt
+        self.dXA_dt = jit(dXA_dt)
 
         # if not vectorized, xz will be 1-D
         def dXZ_dt(xZ, t, params):
@@ -210,16 +202,19 @@ class ODE:
         # self.batchODEZ = jit(vmap(self.runODEZ, (None, 0, None, None)))
 
         # jit compile function to integrate adjoint sensitivity equations
-        self.adjoint = jit(vmap(jacfwd(lambda zt, yt, B: jnp.einsum("i,ij,j", yt-self.C@zt, B, yt-self.C@zt)/2.), (0, 0, None)))
-        self.runODEA = jit(lambda t_eval, xt, at, CRparams: runODEA(t_eval, xt, at, CRparams, self.dXA_dt))
-        self.batchODEA = jit(vmap(lambda t, out, a, p: self.runODEA(jnp.array([0., t]), out, a, p)[self.n_s:], (0, 0, 0, None)))
+        self.adjoint = jit(vmap(jacfwd(lambda zt, yt, B: jnp.einsum("i,ij,j", yt-zt[:self.n_s], B, yt-zt[:self.n_s])/2.), (0, 0, None)))
+        self.runODEA = jit(lambda t, xt, at, cr_params: runODEA(jnp.array([0., t]), xt, at, cr_params, self.dXA_dt)[self.n_s:])
+        # running in batches is slower for some reason...
+        #self.batchODEA = jit(vmap(lambda t, out, a, p: self.runODEA(jnp.array([0., t]), out, a, p)[self.n_s:], (0, 0, 0, None)))
 
-        def GAinvG(G, Linv):
-            return jnp.einsum("tij,kj,kl,tml->tim", G, Linv, Linv, G)
+        # JIT compile matrix operations
+        def GAinvG(G, Ainv):
+            return jnp.einsum("tij,jl,tml->tim", G, Ainv, G)
         self.GAinvG = jit(GAinvG)
 
-        def yCOV_next(Y_error, G, Linv):
-            return jnp.einsum('tk,tl->kl', Y_error, Y_error) + jnp.sum(self.GAinvG(G, Linv), 0)
+        def yCOV_next(Y_error, G, Ainv):
+            # sum over time dimension
+            return jnp.einsum('tk,tl->kl', Y_error, Y_error) + jnp.sum(self.GAinvG(G, Ainv), 0)
         self.yCOV_next = jit(yCOV_next)
 
         def A_next(G, Beta):
@@ -252,29 +247,26 @@ class ODE:
 
         # log transform
         def log_y(y):
-            return jnp.log(y+1e-3)
+            return jnp.log(y+log_tol)
         self.log_y = jit(log_y)
 
         def log_err(f, y):
-            return jnp.log((f+1e-3)/(y+1e-3))
+            return jnp.log((f+log_tol)/(y+log_tol))
         self.log_err = jit(log_err)
 
         # pad zeros
         def pad_zeros(y):
             y_copy = np.copy(y)
             y_copy[y_copy==0] = 1.
-            return y_copy
+            return np.clip(y_copy, log_tol, np.inf)
         self.pad_zeros = pad_zeros
 
-        # compute inverse of L where A = LL^T
-        def compute_Linv(A):
-            return jnp.linalg.inv(jnp.linalg.cholesky(A))
-        self.compute_Linv = jit(compute_Linv)
-
-        # jit compile function to approximate diagonal of covariance
-        def Ainv_diag(Linv):
-            return jnp.diag(Linv.T@Linv)
-        self.Ainv_diag = jit(Ainv_diag)
+        # approximate inverse of A, where A = LL^T, Ainv = Linv^T Linv
+        def compute_Ainv(A):
+            Linv = jnp.linalg.inv(jnp.linalg.cholesky(A))
+            Ainv = Linv.T@Linv
+            return Ainv
+        self.compute_Ainv = jit(compute_Ainv)
 
         def NewtonStep(A, g):
             return jnp.linalg.solve(A,g)
@@ -285,7 +277,7 @@ class ODE:
         self.eval_grad_NLP = jit(eval_grad_NLP)
 
         # jit compile prediction covariance computation
-        def compute_searchCOV(Beta, G, Linv):
+        def compute_searchCOV(Beta, G, Ainv):
             # dimensions of sample
             n_t, n_y, n_theta = G.shape
             # stack G over time points [n, n_t, n_out, n_theta]--> [n, n_t*n_out, n_theta]
@@ -328,7 +320,7 @@ class ODE:
             #     print(self.res)
             self.params = self.res.x
 
-            # update covariance
+            # update precision
             self.update_precision()
 
             # make sure that precision is positive definite (algorithm 3.3 in Numerical Optimization)
@@ -340,6 +332,11 @@ class ODE:
             # increase precision of prior until posterior precision is positive definite
             self.A += tau*np.diag(self.Alpha)
             while jnp.isnan(jnp.linalg.cholesky(self.A)).any():
+                # make sure Alpha isn't zero
+                if np.max(self.Alpha) == 0:
+                    # need to continue with a value greater than zero
+                    self.Alpha = 1e-8*np.ones(self.n_params)
+
                 # increase prior precision
                 tau = np.max([2*tau, beta])
                 self.A += tau*np.diag(self.Alpha)
@@ -370,7 +367,21 @@ class ODE:
             self.itr += 1
 
         # finally compute covariance (Hessian inverse)
-        self.update_covariance()
+        self.final_precision()
+
+        # make sure that precision is positive definite (algorithm 3.3 in Numerical Optimization)
+        if np.min(np.diag(self.A)) > 0:
+            tau = 0.
+        else:
+            tau = beta - np.min(np.diag(self.A))
+
+        # increase precision of prior until posterior precision is positive definite
+        self.A += tau*np.diag(self.Alpha)
+        while jnp.isnan(jnp.linalg.cholesky(self.A)).any():
+            # increase prior precision
+            tau = np.max([2*tau, beta])
+            self.A += tau*np.diag(self.Alpha)
+        self.final_covariance()
         self.final_hypers()
 
     def init_hypers(self):
@@ -397,14 +408,14 @@ class ODE:
                     # N += len(series[::lag]) - 1
 
                     # Evidence optimization collapses with reduced N, so using full N instead
-                    N += self.f_ind*(len(series) - 1)
+                    N += len(series) - 1
             assert k > 0, f"There are no time varying outputs in sample {treatment}"
             self.N += N / k
 
         # init output precision
-        self.n_total = self.N*self.C.shape[0]
-        self.Beta = np.eye(self.C.shape[0])
-        self.BetaInv = np.eye(self.C.shape[0])
+        self.n_total = self.N*self.n_s
+        self.Beta = np.eye(self.n_s)
+        self.BetaInv = np.eye(self.n_s)
 
         # initial guess of parameter precision
         self.alpha = self.alpha_0
@@ -418,7 +429,7 @@ class ODE:
         print("Updating precision...")
 
         # compute inverse of cholesky decomposed precision matrix
-        Linv = self.compute_Linv(self.A)
+        Ainv = self.compute_Ainv(self.A)
 
         # init yCOV
         yCOV = 0.
@@ -437,18 +448,18 @@ class ODE:
 
             # Determine SSE
             Y_error = output[1:, :self.n_s] - Y_measured[1:]
-            yCOV += self.yCOV_next(Y_error, G, Linv)
+            yCOV += self.yCOV_next(Y_error, G, Ainv)
 
         ### M step: update hyper-parameters ###
 
         # maximize complete data log-likelihood w.r.t. alpha and beta
-        Ainv_ii = self.Ainv_diag(Linv)
+        Ainv_ii = np.diag(Ainv)
         self.alpha = self.n_params/(np.sum((self.params-self.prior)**2) + np.sum(Ainv_ii) + 2.*self.a)
         # self.Alpha = self.alpha*np.ones(self.n_params)
         self.Alpha = 1./((self.params-self.prior)**2 + Ainv_ii + 2.*self.a)
 
         # update output precision
-        self.Beta = self.N*np.linalg.inv(yCOV + 2.*self.b*np.eye(self.C.shape[0]))
+        self.Beta = self.N*np.linalg.inv(yCOV + 2.*self.b*np.eye(self.n_s))
         self.Beta = (self.Beta + self.Beta.T)/2.
         self.BetaInv = np.linalg.inv(self.Beta)
 
@@ -515,14 +526,19 @@ class ODE:
             # for batch_inds in np.array_split(np.arange(n_samples), n_samples//self.batch_size):
             # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
 
-            ### Adjoint sensitivity method also seems to be slower?
+            ### Adjoint sensitivity method can be slower depending on stiffness of ODE
             output = np.nan_to_num(self.runODE(t_eval, Y_measured, params[:self.n_r], params[self.n_r:]))
 
             # adjoint at measured time points
             at = self.adjoint(output, Y_measured, self.Beta)
 
             # gradient of NLP
-            grad_NLP += np.sum(self.batchODEA(t_eval[1:], output[1:], at[1:], params[self.n_r:]), 0)
+            for t, out, a in zip(t_eval[1:], output[1:], at[1:]):
+                grad_NLP += self.runODEA(t, out, a, params[self.n_r:])
+
+            if np.any(np.isnan(grad_NLP)):
+                print("NaN gradient, switching to forward sensitivity method!")
+                return self.jacobian_fwd(params)
 
         # return gradient of NLP
         return grad_NLP
@@ -600,33 +616,32 @@ class ODE:
         # Laplace approximation of posterior precision
         self.A = (self.A + self.A.T)/2.
 
-    def update_covariance(self):
-        ### Approximate / fast method ###
-        self.Linv = self.compute_Linv(self.A)
+    def final_precision(self):
+        # update parameter precision matrix assuming log-normal output distribution
+        self.A = np.diag(self.Alpha)
 
-        ### More accurate / slow method ###
-        # # update parameter covariance matrix given current parameter estimate
-        # self.Ainv = np.diag(1./self.Alpha)
-        #
-        # # loop over each sample in dataset
-        # for treatment, t_eval, Y_measured in self.dataset:
-        #
-        #     # run model in batches
-        #     # for batch_inds in np.array_split(np.arange(n_samples), n_samples//self.batch_size):
-        #     # outputs = np.nan_to_num(self.batchODEZ(t_eval, Y_batch[batch_inds], self.params[:self.n_r], self.params[self.n_r:]))
-        #
-        #     # for each output
-        #     output, Z0, Z = self.runODEZ(t_eval, Y_measured, params[:self.n_r], params[self.n_r:])
-        #
-        #     # stack gradient matrices
-        #     G = np.concatenate((Z0, Z), axis=-1)[1:, :self.n_s]
-        #
-        #     # compute covariance
-        #     for Gt in G:
-        #         self.Ainv -= self.Ainv_next(Gt, self.Ainv, self.BetaInv)
-        #
-        # # Laplace approximation of posterior covariance
-        # self.Ainv = (self.Ainv + self.Ainv.T)/2.
+        # loop over each sample in dataset
+        for treatment, t_eval, Y_measured in self.dataset:
+
+            # for each output
+            output, Z0, Z = self.runODEZ(t_eval, Y_measured, self.params[:self.n_r], self.params[self.n_r:])
+
+            # stack gradient matrices
+            G = np.concatenate((Z0, Z), axis=-1)[1:, :self.n_s]
+
+            # account for gradient of the log of species predictions
+            G = np.einsum('ij,ijk->ijk', 1./self.pad_zeros(output[1:, :self.n_s]), G)
+
+            # compute Hessian
+            self.A += self.A_next(G, self.Beta)
+
+        # Laplace approximation of posterior precision
+        self.A = (self.A + self.A.T)/2.
+
+    def final_covariance(self):
+
+        ### Approximate / fast method to compute inverse ###
+        self.Ainv = self.compute_Ainv(self.A)
 
     # compute the log marginal likelihood
     def update_evidence(self):
@@ -664,7 +679,7 @@ class ODE:
         G = np.einsum('ij,ijk->ijk', 1./self.pad_zeros(output[:,:self.n_s]), G)
 
         # calculate covariance of each output (dimension = [steps, outputs])
-        covariance = self.LogBetaInv + self.GAinvG(G, self.Linv)
+        covariance = self.LogBetaInv + self.GAinvG(G, self.Ainv)
 
         # predicted stdv of log y
         get_diag = vmap(jnp.diag, (0,))
@@ -681,9 +696,10 @@ class ODE:
 
         # monte carlo draws from posterior
         z = np.random.randn(n_samples, self.n_params)
-        posterior_params = self.params + np.einsum('jk,ik->ij', self.Linv, z)
+        Linv = np.linalg.cholesky(self.Ainv)
+        posterior_params = self.params + np.einsum('jk,ik->ij', Linv, z)
 
         # make point predictions of shape [n_mcmc, n_samples, n_time, n_outputs]
-        preds = vmap(lambda params: jnp.nan_to_num(self.runODE(t_eval, jnp.atleast_2d(x_test), self.params[:self.n_r], params[self.n_r:])), (0,))(posterior_params)
+        preds = vmap(lambda params: jnp.nan_to_num(self.runODE(t_eval, jnp.atleast_2d(x_test), params[:self.n_r], params[self.n_r:])), (0,))(posterior_params)
 
         return preds
