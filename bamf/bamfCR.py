@@ -186,7 +186,7 @@ class ODE:
             dxdt  = system(x, t, params)
 
             # time derivative of initial condition sensitivity
-            # Jacobian-vector-product approach is surprisingly slow 
+            # Jacobian-vector-product approach is surprisingly slow
             # JxV  = vmap(lambda z: jax.jvp(lambda x: system(x,t,params), (x,), (z,))[1], (1), (1))
             Jx = jacfwd(system, 0)(x, t, params)
             JxZ0 = Jx@Z0 # JxV(Z0)
@@ -319,11 +319,10 @@ class ODE:
 
             # fit using updated Alpha and Beta
             self.res = minimize(fun=self.objective,
-                                jac=self.jacobian,
-                                hess=self.hessian,
+                                jac=self.jacobian, #hess=self.hessian,
                                 x0=self.params,
                                 tol=nlp_tol,
-                                method='Newton-CG',
+                                method='BFGS',
                                 callback=self.callback)
             # if self.verbose:
             #     print(self.res)
