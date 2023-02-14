@@ -311,11 +311,10 @@ class ODE:
 
             # fit using updated Alpha and Beta
             self.res = minimize(fun=self.objective,
-                                jac=self.jacobian,
-                                hess=self.hessian,
+                                jac=self.jacobian, #hess=self.hessian,
                                 x0=self.params,
                                 tol=nlp_tol,
-                                method='Newton-CG',
+                                method='BFGS',
                                 callback=self.callback)
             # if self.verbose:
             #     print(self.res)
