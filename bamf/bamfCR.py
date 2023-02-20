@@ -353,7 +353,7 @@ class ODE:
 
             # fit using updated Alpha and Beta
             self.res = minimize(fun=self.objective,
-                                jac=self.jacobian,
+                                jac=self.jacobian_fwd,
                                 hess=self.hessian,
                                 x0=self.params,
                                 tol=nlp_tol,
@@ -644,7 +644,7 @@ class ODE:
 
         # make predictions given initial conditions and evaluation times
         s_present = np.array(x_test > 0, int)
-        Y_predicted = np.nan_to_num(self.runODE(teval, np.atleast_2d(x_test), self.params[:self.n_r], self.params[self.n_r:], s_present))
+        Y_predicted = np.nan_to_num(self.runODE(teval, np.atleast_2d(np.log(x_test+1e-8)), self.params[:self.n_r], self.params[self.n_r:], s_present))
 
         return np.einsum('ij,j->ij', np.exp(Y_predicted), s_present)
 
